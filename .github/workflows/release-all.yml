@@ -1,0 +1,399 @@
+name: Release All Platforms
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (defaults to v<version> from src-tauri/tauri.conf.json)
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: Mark GitHub Release as prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-all-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ALIASMODE_FIREFOX_RELEASE: aliasmode-runtime-156.0.1-beta.36-r14
+  ALIASMODE_FIREFOX_WIN_ARCHIVE: aliasmode-156.0.1-beta.36-win.x86_64.zip
+  ALIASMODE_FIREFOX_WIN_ARCHIVE_SHA256: 23d2531f5a72dbfde049319259bcee55407a2ba7afc570398446da5c1f20cfcb
+  ALIASMODE_FIREFOX_WIN_EXECUTABLE_SHA256: 1a031ad448359f65b299634dd6fd0027c556f4c7807c2e0fb17f48a76fba7337
+
+jobs:
+  windows:
+    name: Windows x64 (slim + offline)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - run: bun install --frozen-lockfile
+      - name: Download and verify pinned AliasMode Firefox
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "artifacts/firefox" | Out-Null
+          gh release download $env:ALIASMODE_FIREFOX_RELEASE `
+            --repo aliasmode/aliasmode-firefox `
+            --pattern $env:ALIASMODE_FIREFOX_WIN_ARCHIVE `
+            --dir "artifacts/firefox"
+          $archivePath = Join-Path "artifacts/firefox" $env:ALIASMODE_FIREFOX_WIN_ARCHIVE
+          $actualSha = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -cne $env:ALIASMODE_FIREFOX_WIN_ARCHIVE_SHA256) {
+            throw "Firefox archive SHA-256 mismatch: $actualSha"
+          }
+      - name: Prepare Windows bundle with official baseline Bun
+        shell: pwsh
+        env:
+          ALIASMODE_FIREFOX_ARCHIVE: ${{ github.workspace }}\artifacts\firefox\aliasmode-156.0.1-beta.36-win.x86_64.zip
+          ALIASMODE_FIREFOX_ARCHIVE_SHA256: ${{ env.ALIASMODE_FIREFOX_WIN_ARCHIVE_SHA256 }}
+          ALIASMODE_FIREFOX_EXECUTABLE_SHA256: ${{ env.ALIASMODE_FIREFOX_WIN_EXECUTABLE_SHA256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pinnedSha = "23f2df1f40d963e5b6104e1a565df992aab8968da5004f460617073843b8b8be"
+          $zip = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline.zip"
+          $root = Join-Path $env:RUNNER_TEMP "bun-windows-x64-baseline"
+          Invoke-WebRequest "https://github.com/oven-sh/bun/releases/download/bun-v1.2.21/bun-windows-x64-baseline.zip" -OutFile $zip
+          $actualSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -cne $pinnedSha) { throw "Baseline Bun SHA-256 mismatch: $actualSha" }
+          Expand-Archive $zip $root -Force
+          $baselineBun = (Get-ChildItem $root -Recurse -File -Filter "bun.exe" | Select-Object -First 1).FullName
+          if (-not $baselineBun) { throw "baseline bun.exe not found" }
+          & $baselineBun scripts/prepare-windows-bundle.ts
+          if ($LASTEXITCODE -ne 0) { throw "prepare-windows-bundle failed" }
+      - name: Build Windows slim and offline NSIS installers
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = [string](Get-Content ".\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $outDir = Join-Path $env:RUNNER_TEMP "release-windows"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          Write-Host "=== Building slim installer ==="
+          & .\scripts\build-windows-installer.ps1 -Flavor slim -OutputDirectory $outDir
+          if ($LASTEXITCODE -ne 0) { throw "slim NSIS build failed" }
+
+          Remove-Item -LiteralPath ".\src-tauri\target\release\nsis" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath ".\src-tauri\target\release\bundle\nsis" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Write-Host "=== Building full offline installer ==="
+          & .\scripts\build-windows-installer.ps1 -Flavor full -OutputDirectory $outDir
+          if ($LASTEXITCODE -ne 0) { throw "full NSIS build failed" }
+
+          $slimPath = Join-Path $outDir "AliasMode_${version}_x64-setup.exe"
+          $fullPath = Join-Path $outDir "AliasMode_${version}_x64-offline-setup.exe"
+          $slimLen = (Get-Item -LiteralPath $slimPath).Length
+          $fullLen = (Get-Item -LiteralPath $fullPath).Length
+          Write-Host "slim bytes: $slimLen, full bytes: $fullLen"
+          if (($fullLen - $slimLen) -lt 100MB) {
+            throw "Offline installer size delta unexpectedly small ($fullLen vs $slimLen)"
+          }
+
+          $lines = @(
+            "$((Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToLowerInvariant())  AliasMode_${version}_x64-offline-setup.exe",
+            "$((Get-FileHash -LiteralPath $slimPath -Algorithm SHA256).Hash.ToLowerInvariant())  AliasMode_${version}_x64-setup.exe"
+          )
+          [IO.File]::WriteAllText(
+            (Join-Path $outDir "SHA256SUMS-windows.txt"),
+            (($lines -join "`n") + "`n"),
+            [Text.UTF8Encoding]::new($false)
+          )
+          "version=$version" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: ${{ runner.temp }}/release-windows/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  macos:
+    name: macOS ${{ matrix.arch }} (dmg + tar.gz)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: aarch64, runner: macos-15 }
+          - { arch: x64, runner: macos-15-intel }
+    env:
+      ARCH: ${{ matrix.arch }}
+      BUNDLE: src-tauri/target/release/bundle
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+      - run: bun install --frozen-lockfile
+      - name: Build macOS app bundle
+        run: bun run desktop:prepare:macos && bunx tauri build --bundles app
+      - name: Build macOS DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          mkdir -p "$BUNDLE/dmg"
+          dmg="$BUNDLE/dmg/AliasMode_${version}_${ARCH}.dmg"
+          venv="$RUNNER_TEMP/dmgbuild"
+          if python3 -m venv "$venv" &&
+            "$venv/bin/pip" install --quiet --require-hashes --only-binary :all: -r src-tauri/macos/dmg-requirements.txt &&
+            "$venv/bin/dmgbuild" -s src-tauri/macos/dmg-settings.py \
+              -D app="$BUNDLE/macos/AliasMode.app" -D background=src-tauri/macos/dmg-background.png \
+              AliasMode "$dmg"; then
+            echo "dmgbuild made the styled disk image"
+          else
+            echo "::warning::dmgbuild failed; making a plain disk image"
+            stage="$RUNNER_TEMP/dmg-stage"
+            rm -rf "$stage"
+            mkdir -p "$stage"
+            ditto "$BUNDLE/macos/AliasMode.app" "$stage/AliasMode.app"
+            ln -s /Applications "$stage/Applications"
+            for attempt in 1 2 3; do
+              hdiutil create -volname AliasMode -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg" && break
+              [[ "$attempt" == 3 ]] && exit 1
+              sleep 30
+            done
+          fi
+          hdiutil verify "$dmg"
+      - name: Verify bundle and package macOS assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          app="$BUNDLE/macos/AliasMode.app"
+          for file in aliasmode aliasmode-sidecar aliasmode-mcp; do
+            test -x "$app/Contents/MacOS/$file"
+          done
+          test -x "$app/Contents/Resources/playwright/node/node"
+          codesign --verify --deep --strict "$app"
+          codesign --verify --deep --strict "$app/Contents/Resources/firefox/AliasMode.app"
+
+          out="$RUNNER_TEMP/release-macos-$ARCH"
+          mkdir -p "$out"
+          cp "$BUNDLE/dmg/AliasMode_${version}_${ARCH}.dmg" "$out/"
+          tar -czf "$out/AliasMode_${version}_${ARCH}.app.tar.gz" -C "$BUNDLE/macos" AliasMode.app
+          (cd "$out" && shasum -a 256 "AliasMode_${version}_${ARCH}.app.tar.gz" "AliasMode_${version}_${ARCH}.dmg" > "SHA256SUMS-macos-${ARCH}.txt")
+          ls -lh "$out"
+          cat "$out/SHA256SUMS-macos-${ARCH}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-macos-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  linux:
+    name: Linux x86_64 (tar.gz + deb)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev build-essential pkg-config
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+      - run: bun install --frozen-lockfile
+      - name: Build Linux desktop bundle
+        run: bun run desktop:build:linux
+      - name: Package Linux tar.gz and deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          data="$(find src-tauri/target/release/bundle/deb -mindepth 2 -maxdepth 2 -type d -name data | head -n 1)"
+          test -n "$data"
+          deb="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          test -n "$deb"
+
+          app="$RUNNER_TEMP/AliasMode"
+          rm -rf "$app"
+          cp -a "$data/usr" "$app"
+          for file in aliasmode aliasmode-sidecar aliasmode-mcp; do
+            test -x "$app/bin/$file"
+          done
+          test -x "$app/lib/AliasMode/firefox/aliasmode"
+          test -x "$app/lib/AliasMode/playwright/node/node"
+
+          out="$RUNNER_TEMP/release-linux"
+          mkdir -p "$out"
+          tar --hard-dereference -czf "$out/AliasMode_${version}_x86_64-linux.tar.gz" -C "$RUNNER_TEMP" AliasMode
+          cp "$deb" "$out/AliasMode_${version}_amd64.deb"
+          dpkg-deb --info "$out/AliasMode_${version}_amd64.deb" | head -n 20
+          (cd "$out" && sha256sum "AliasMode_${version}_amd64.deb" "AliasMode_${version}_x86_64-linux.tar.gz" > SHA256SUMS-linux.txt)
+          ls -lh "$out"
+          cat "$out/SHA256SUMS-linux.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: ${{ runner.temp }}/release-linux/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: staging/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-macos-aarch64
+          path: staging/macos-aarch64
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-macos-x64
+          path: staging/macos-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: staging/linux
+      - name: Assemble, verify checksums, and publish release
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v$version"
+          fi
+
+          mkdir -p release-assets
+          cp "staging/windows/AliasMode_${version}_x64-setup.exe" release-assets/
+          cp "staging/windows/AliasMode_${version}_x64-offline-setup.exe" release-assets/
+          cp "staging/macos-aarch64/AliasMode_${version}_aarch64.dmg" release-assets/
+          cp "staging/macos-aarch64/AliasMode_${version}_aarch64.app.tar.gz" release-assets/
+          cp "staging/macos-x64/AliasMode_${version}_x64.dmg" release-assets/
+          cp "staging/macos-x64/AliasMode_${version}_x64.app.tar.gz" release-assets/
+          cp "staging/linux/AliasMode_${version}_x86_64-linux.tar.gz" release-assets/
+          cp "staging/linux/AliasMode_${version}_amd64.deb" release-assets/
+          cp "staging/linux/SHA256SUMS-linux.txt" release-assets/
+          cat "staging/macos-aarch64/SHA256SUMS-macos-aarch64.txt" \
+              "staging/macos-x64/SHA256SUMS-macos-x64.txt" > release-assets/SHA256SUMS-macos.txt
+
+          (
+            cd release-assets
+            sha256sum \
+              "AliasMode_${version}_x64-setup.exe" \
+              "AliasMode_${version}_x64-offline-setup.exe" \
+              "AliasMode_${version}_aarch64.dmg" \
+              "AliasMode_${version}_aarch64.app.tar.gz" \
+              "AliasMode_${version}_x64.dmg" \
+              "AliasMode_${version}_x64.app.tar.gz" \
+              "AliasMode_${version}_x86_64-linux.tar.gz" \
+              "AliasMode_${version}_amd64.deb" > SHA256SUMS.txt
+            sha256sum --check --strict SHA256SUMS.txt
+            sha256sum --check --strict SHA256SUMS-macos.txt
+            sha256sum --check --strict SHA256SUMS-linux.txt
+          )
+
+          cat > release-notes.md <<EOF
+          ## AliasMode ${version}（全平台构建版）
+
+          基于上游 \`v0.1.0-beta.75\` 增强构建，开箱即用本地模式 + 端到端加密 WebDAV 同步。
+
+          ### 主要特性
+          - **WebDAV 端到端加密同步**：替代官方云登录，支持 AES-256-GCM 手动同步环境配置、标签、文件夹与代理设置。
+          - **三模式网络路由**：环境支持「本地直连」「本地 Clash」「代理节点（含链式前置代理）」切换；内置 Clash / Mihomo TUN 放行规则（YAML 与 Clash Verge JS 覆写脚本一键复制）。
+          - **sing-box 节点池与机场订阅**：支持 VLESS / VMess / Trojan / Shadowsocks / Hysteria 2 / TUIC / WireGuard / SOCKS5 / HTTP 链接、Base64、Clash YAML、sing-box JSON 订阅导入；内置纯 IP DoH 解析避免 TUN Fake-IP DNS 死锁。
+          - **真实延迟测速 & IP 风险评估**：Anycast HTTP 204 真实 RTT 测速、单进程流式批量测活（支持进度条/取消/失败原因记录）、并发去重 IP 风险分与多列排序筛选。
+
+          ### 下载说明
+          | 平台 | 文件 | 说明 |
+          | --- | --- | --- |
+          | **Windows x64（推荐）** | \`AliasMode_${version}_x64-setup.exe\` | 在线精简安装包（复用系统 WebView2） |
+          | **Windows x64（离线完整版）** | \`AliasMode_${version}_x64-offline-setup.exe\` | 内置 Edge WebView2 离线组件 |
+          | **macOS Apple Silicon (M1–M4)** | \`AliasMode_${version}_aarch64.dmg\` / \`.app.tar.gz\` | 首次打开如遇未公证提示，请右键「打开」或在终端执行 \`xattr -dr com.apple.quarantine /Applications/AliasMode.app\` |
+          | **macOS Intel (x64)** | \`AliasMode_${version}_x64.dmg\` / \`.app.tar.gz\` | 适用于 Intel 芯片 Mac |
+          | **Linux x86_64** | \`AliasMode_${version}_amd64.deb\` / \`_x86_64-linux.tar.gz\` | Debian/Ubuntu 推荐使用 \`.deb\`，其他发行版可使用 \`.tar.gz\` |
+
+          校验文件：\`SHA256SUMS.txt\`、\`SHA256SUMS-macos.txt\`、\`SHA256SUMS-linux.txt\`
+          EOF
+
+          assets=(
+            "release-assets/AliasMode_${version}_x64-setup.exe"
+            "release-assets/AliasMode_${version}_x64-offline-setup.exe"
+            "release-assets/AliasMode_${version}_aarch64.dmg"
+            "release-assets/AliasMode_${version}_aarch64.app.tar.gz"
+            "release-assets/AliasMode_${version}_x64.dmg"
+            "release-assets/AliasMode_${version}_x64.app.tar.gz"
+            "release-assets/AliasMode_${version}_x86_64-linux.tar.gz"
+            "release-assets/AliasMode_${version}_amd64.deb"
+            "release-assets/SHA256SUMS.txt"
+            "release-assets/SHA256SUMS-macos.txt"
+            "release-assets/SHA256SUMS-linux.txt"
+          )
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "AliasMode ${version}" --notes-file release-notes.md
+            gh release upload "$tag" --clobber "${assets[@]}"
+          else
+            flags=(--target "${GITHUB_SHA}" --title "AliasMode ${version}" --notes-file release-notes.md)
+            if [[ "$INPUT_PRERELEASE" == "true" ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$tag" "${flags[@]}" "${assets[@]}"
+          fi
+
+          gh release view "$tag" --json tagName,url,assets --jq '{tagName, url, count: (.assets | length), assets: [.assets[] | {name, size}]}'
