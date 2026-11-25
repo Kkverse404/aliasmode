@@ -141,15 +141,12 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }} (dmg + tar.gz)
-    if: ${{ inputs.reuse_run_id == '' || matrix.arch == 'aarch64' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { arch: aarch64, node_arch: arm64, lipo_arch: arm64, rust_target: aarch64-apple-darwin, runner: macos-15-intel }
-          - { arch: x64, node_arch: x64, lipo_arch: x86_64, rust_target: x86_64-apple-darwin, runner: macos-15-intel }
+        include: ${{ fromJSON(inputs.reuse_run_id == '' && '[{"arch":"aarch64","node_arch":"arm64","lipo_arch":"arm64","rust_target":"aarch64-apple-darwin","runner":"macos-15-intel"},{"arch":"x64","node_arch":"x64","lipo_arch":"x86_64","rust_target":"x86_64-apple-darwin","runner":"macos-15-intel"}]' || '[{"arch":"aarch64","node_arch":"arm64","lipo_arch":"arm64","rust_target":"aarch64-apple-darwin","runner":"macos-15-intel"}]') }}
     env:
       ARCH: ${{ matrix.arch }}
       NODE_ARCH: ${{ matrix.node_arch }}
