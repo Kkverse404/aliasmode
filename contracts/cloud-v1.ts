@@ -181,11 +181,15 @@ export interface PortableSessionV1 {
 }
 
 export interface CloudProxy {
-  type: "http" | "https" | "socks5";
+  type: "http" | "https" | "socks5" | "vless" | "vmess" | "trojan" | "ss" | "hysteria2" | "tuic" | "wireguard";
   host: string;
   port: string;
   user: string;
   pass: string;
+  uri?: string;
+  label?: string;
+  mode?: "local-clash";
+  preProxy?: CloudProxy;
 }
 
 export interface CloudProxyInventoryProfile {

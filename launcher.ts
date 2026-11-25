@@ -45,7 +45,9 @@ import {
   platformFromUA, proxyServerFlag,
 } from "./fingerprint.ts";
 export { isMobileUserAgent } from "./fingerprint.ts";
-import { startProxyRelay, type ProxyRelay } from "./proxy-relay.ts";
+import { isSingBoxProxy } from "./proxy.ts";
+import { resolveRuntimeProxy, shouldRouteNodesViaSingBox } from "./local-network.ts";
+import { startProxyRelayForSpec, type ProxyRelay } from "./proxy-relay.ts";
 import type { SearchProviderBootstrapOptions, SearchProviderSetupResult } from "./search-provider.ts";
 import { assertSafeProfileId } from "./profile-id.ts";
 import { dpapiKeysReadable, localStateDpapiKey } from "./dpapi.ts";
@@ -95,9 +97,12 @@ function webRtcPolicy(profile: Profile): string {
 }
 
 function needsProxyRelay(profile: Profile): boolean {
-  return !!profile.proxy && (
-    profile.proxy.type === "socks5"
-    || (profile.proxy.type === "http" && !!profile.proxy.user)
+  const p = resolveRuntimeProxy(profile.proxy);
+  return !!p && (
+    isSingBoxProxy(p)
+    || p.type === "socks5"
+    || (p.type === "http" && !!p.user)
+    || (p.mode !== "local-clash" && p.type === "http" && shouldRouteNodesViaSingBox(p))
   );
 }
 
@@ -1548,12 +1553,14 @@ export class Launcher {
     if (keepAlive && profile.chromiumRuntime && ALIASMODE_CHROMIUM_KEEP_ALIVE) {
       args.push("--aliasmode-keep-alive");
     }
-    // Relayed proxies use a loopback HTTP endpoint. Everything else uses the
-    // upstream proxy flag directly.
+    // Relayed proxies use a loopback HTTP endpoint. Direct profiles explicitly pass
+    // `--no-proxy-server` so they never inherit Windows/macOS system proxy settings (e.g. Clash).
     if (relayPort) args.push(`--proxy-server=http://127.0.0.1:${relayPort}`);
     else {
-      const proxy = proxyServerFlag(profile);
+      const resolvedProxy = resolveRuntimeProxy(profile.proxy);
+      const proxy = resolvedProxy ? proxyServerFlag({ ...profile, proxy: resolvedProxy }) : null;
       if (proxy) args.push(proxy);
+      else args.push("--no-proxy-server");
     }
     // Load any assigned (unpacked) extensions. Resolve ids → install dirs and
     // skip any that are not installed on this device. --disable-extensions-except
@@ -1914,7 +1921,7 @@ export class Launcher {
     try {
       // A running browser is checked with the identity it was launched with; saved edits wait for its next start.
       const checked = launchedProfile(profile, this.store.getLaunch(profileId));
-      if (checked.proxy?.type === "https" && checked.proxy.user) {
+      if (checked.proxy?.type === "https" && checked.proxy.user && !checked.proxy.preProxy) {
         throw new BrowserLaunchError("preflight", "proxy_https_auth");
       }
       this.assertHostCompatibility(checked);
@@ -2107,7 +2114,7 @@ export class Launcher {
       profile = current!;
       profileSnapshot = JSON.stringify(profile);
       // The checks above saw the identity of the browser that ran; this launch uses the saved one.
-      if (profile.proxy?.type === "https" && profile.proxy.user) {
+      if (profile.proxy?.type === "https" && profile.proxy.user && !profile.proxy.preProxy) {
         throw new BrowserLaunchError("preflight", "proxy_https_auth");
       }
       this.assertHostCompatibility(profile);
@@ -2232,16 +2239,7 @@ export class Launcher {
         const p = profile.proxy!;
         let relay: ProxyRelay;
         try {
-          relay = await startProxyRelay(
-            {
-              type: p.type === "socks5" ? "socks5" : "http",
-              host: p.host,
-              port: Number(p.port),
-              user: p.user,
-              pass: p.pass,
-            },
-            {},
-          );
+          relay = await startProxyRelayForSpec(p, { log: (m) => this.log(m) });
         } catch {
           throw new BrowserLaunchError("relay_setup");
         }
@@ -2709,10 +2707,7 @@ export class Launcher {
     try {
       if (needsProxyRelay(profile)) {
         const proxy = profile.proxy!;
-        const relay = await startProxyRelay({
-          type: proxy.type === "socks5" ? "socks5" : "http",
-          host: proxy.host, port: Number(proxy.port), user: proxy.user, pass: proxy.pass,
-        }, {});
+        const relay = await startProxyRelayForSpec(proxy, { log: (m) => this.log(m) });
         this.closeRelay(profileId);
         this.relays.set(profileId, relay);
         launch.relayPort = relay.port;
@@ -2721,9 +2716,10 @@ export class Launcher {
       this.store.recordLaunch(launch);
       reserved = true;
       this.liveReserved.add(port);
+      const resolvedProxy = resolveRuntimeProxy(profile.proxy);
       const proxy = launch.relayPort
         ? { server: `http://127.0.0.1:${launch.relayPort}` }
-        : profile.proxy ? { server: `${profile.proxy.type}://${profile.proxy.host}:${profile.proxy.port}` } : undefined;
+        : resolvedProxy ? { server: `${resolvedProxy.type}://${resolvedProxy.host}:${resolvedProxy.port}` } : undefined;
       // The engine shows the label in the native window title and adds the " — " separator itself,
       // so no page script edits document.title.
       const windowLabel = this.skipDefaultWindowLabel
@@ -2735,6 +2731,7 @@ export class Launcher {
         prefs: {
           ...firefoxStartupPrefs(profile, this.hostPlatform, this.hostArch),
           ...(fontsDir ? firefoxFontPackPrefs(fontsDir, this.hostPlatform) : {}),
+          ...(!proxy ? { "network.proxy.type": 0 } : {}),
           // Firefox outlives its last window on macOS anyway; elsewhere the engine keeps running for this pref.
           ...(opts.keepAliveWithoutWindows && this.hostPlatform !== "darwin" ? { "aliasmode.keepAliveWithoutWindows": true } : {}),
         },
@@ -3493,15 +3490,9 @@ export class Launcher {
     }
     let relay: ProxyRelay;
     try {
-      relay = await startProxyRelay(
-        {
-          type: profile.proxy!.type === "socks5" ? "socks5" : "http",
-          host: profile.proxy!.host,
-          port: Number(profile.proxy!.port),
-          user: profile.proxy!.user,
-          pass: profile.proxy!.pass,
-        },
-        { port: launch.relayPort },
+      relay = await startProxyRelayForSpec(
+        profile.proxy!,
+        { port: launch.relayPort, log: (m) => this.log(m) },
       );
     } catch {
       throw new BrowserLaunchError("relay_setup");
@@ -5551,9 +5542,12 @@ function sessionLaunchSpawn(
 const SESSION_LAUNCH = shouldLaunchViaWindowsSession();
 
 /** aliasmode's own HTTP port, so the profile card can be served/opened over loopback. */
-const ALIASMODE_PORT = process.env.ALIASMODE_PORT ? Number(process.env.ALIASMODE_PORT) : 50400;
+function currentAliasmodePort(): number {
+  const parsed = process.env.ALIASMODE_PORT ? Number(process.env.ALIASMODE_PORT) : 50400;
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65_535 ? parsed : 50400;
+}
 function profileCardUrl(profileId: string): string {
-  return `http://127.0.0.1:${ALIASMODE_PORT}/card?id=${encodeURIComponent(profileId)}`;
+  return `http://127.0.0.1:${currentAliasmodePort()}/card?id=${encodeURIComponent(profileId)}`;
 }
 
 /**

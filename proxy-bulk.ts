@@ -1,7 +1,7 @@
 import { parse } from "csv-parse/sync";
 import { checkProxy, type ProxyCheckOptions, type ProxyCheckResult } from "./proxy-check.ts";
 import { fetchDirectEgress, type EgressInfo } from "./egress.ts";
-import { normalizeProxySpec, parseProxySpec, proxyHostPort, proxyIdentityKey } from "./proxy.ts";
+import { isSingBoxProxy, normalizeProxySpec, parseProxySpec, proxyDisplaySummary, proxyHostPort, proxyIdentityKey } from "./proxy.ts";
 import { parseProxyReplacementCsv } from "./proxy-replacements.ts";
 import type { ProxySpec } from "./types.ts";
 import type { ProxyCheckView, ProxyPreviewInput, ProxyProgressEvent, ProxyReplacementView, ProxyScope } from "./proxy-tools-types.ts";
@@ -57,8 +57,8 @@ export function buildProxyPreview(profiles: ProxyInventoryProfile[], input: Prox
       view: {
         index: rows.length,
         ...(profile ? { profileId: profile.id, name: profile.name, group: profile.group } : {}),
-        previousProxy: profile?.proxy ? `${profile.proxy.type}://${proxyHostPort(profile.proxy)}` : null,
-        proxy: next ? `${next.type}://${proxyHostPort(next)}` : null,
+        previousProxy: profile?.proxy ? proxyDisplaySummary(profile.proxy) : null,
+        proxy: next ? proxyDisplaySummary(next) : null,
         ...(code ? { status: "skipped" as const, code } : next ? replacementState(profile, next) : { status: "skipped" as const, code: "no_replacement" }),
       },
       next,
@@ -125,7 +125,7 @@ export async function checkProfileProxies(
   const excluded: ProxyCheckView[] = [];
   for (const profile of profiles) {
     const ref = { id: profile.id, name: profile.name, group: profile.group };
-    const base = { key: crypto.randomUUID(), proxy: profile.proxy ? `${profile.proxy.type}://${proxyHostPort(profile.proxy)}` : null, profiles: [ref], checkedAt: Date.now() };
+    const base = { key: crypto.randomUUID(), proxy: profile.proxy ? proxyDisplaySummary(profile.proxy) : null, profiles: [ref], checkedAt: Date.now() };
     if (profile.proxyError || !profile.proxy) {
       excluded.push({ ...base, status: profile.proxyError ? "invalid" : "missing" });
       continue;
@@ -133,7 +133,7 @@ export async function checkProfileProxies(
     const key = proxyIdentityKey(profile.proxy);
     const group = unique.get(key);
     if (group) group.row.profiles.push(ref);
-    else unique.set(key, { proxy: profile.proxy, row: { ...base, status: profile.proxy.type === "https" ? "unsupported" : "unavailable" } });
+    else unique.set(key, { proxy: profile.proxy, row: { ...base, status: !isSingBoxProxy(profile.proxy) && profile.proxy.type === "https" ? "unsupported" : "unavailable" } });
   }
   send({ type: "summary", selectedProfiles: profiles.length, uniqueProxies: unique.size, duplicatesSkipped: profiles.length - excluded.length - unique.size });
   for (const row of excluded) send({ type: "check", row });
@@ -147,8 +147,24 @@ export async function checkProfileProxies(
       const item = items[index++]!;
       if (item.row.status !== "unsupported") {
         try {
-          const result = await (deps.check ?? checkProxy)(item.proxy, { direct });
-          item.row = { ...item.row, status: result.status, reason: result.reason, ip: result.ip, country: result.country, checkedAt: Date.now() };
+          const result = await (deps.check
+            ? deps.check(item.proxy, { direct })
+            : checkProxy(item.proxy, { direct, includeRisk: true }));
+          item.row = {
+            ...item.row,
+            status: result.status,
+            reason: result.reason,
+            ip: result.ip,
+            country: result.country,
+            ...(result.city ? { city: result.city } : {}),
+            ...(result.isp ? { isp: result.isp } : {}),
+            ...(result.ipType ? { ipType: result.ipType } : {}),
+            ...(typeof result.riskScore === "number" ? { riskScore: result.riskScore } : {}),
+            ...(result.riskLevel ? { riskLevel: result.riskLevel } : {}),
+            ...(Array.isArray(result.riskFlags) && result.riskFlags.length ? { riskFlags: result.riskFlags } : {}),
+            ...(typeof result.latencyMs === "number" ? { latencyMs: result.latencyMs } : {}),
+            checkedAt: Date.now(),
+          };
         } catch { item.row = { ...item.row, status: "unavailable", reason: "check_unavailable", checkedAt: Date.now() }; }
       }
       send({ type: "check", row: item.row });

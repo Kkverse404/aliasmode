@@ -16,6 +16,9 @@
 
 import net from "node:net";
 import { openSocks5Tunnel } from "./geoip.ts";
+import { resolveRuntimeProxy, shouldRouteNodesViaSingBox } from "./local-network.ts";
+import { isSingBoxProxy } from "./proxy.ts";
+import { startSingBoxRelay, type SingBoxRelayOptions } from "./singbox-runtime.ts";
 import type { ProxySpec } from "./types.ts";
 
 export interface UpstreamProxy {
@@ -43,6 +46,30 @@ export interface RelayOptions {
 const MAX_HEAD = 64 * 1024; // cap a request/response head so a never-terminating head can't grow unbounded
 
 type TrackSocket = (socket: net.Socket) => net.Socket;
+
+/** Start a loopback relay for any ProxySpec: sing-box sidecar for advanced/chained/isolated nodes, light TCP relay otherwise. */
+export function startProxyRelayForSpec(
+  proxy: ProxySpec,
+  opts: SingBoxRelayOptions & { preferSingBox?: boolean } = {},
+): Promise<ProxyRelay> {
+  const resolved = resolveRuntimeProxy(proxy) ?? proxy;
+  const useSingBox = isSingBoxProxy(resolved)
+    || (
+      resolved.mode !== "local-clash"
+      && (resolved.type === "http" || resolved.type === "socks5")
+      && (opts.preferSingBox ?? shouldRouteNodesViaSingBox(resolved))
+    );
+  if (useSingBox) {
+    return startSingBoxRelay(resolved, opts);
+  }
+  return startProxyRelay({
+    type: resolved.type === "socks5" ? "socks5" : "http",
+    host: resolved.host,
+    port: Number(resolved.port),
+    user: resolved.user,
+    pass: resolved.pass,
+  }, opts);
+}
 
 /** Start a loopback relay that forwards to `up`, injecting its credentials. Resolves once listening. */
 export function startProxyRelay(up: UpstreamProxy, opts: RelayOptions = {}): Promise<ProxyRelay> {

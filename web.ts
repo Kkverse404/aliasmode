@@ -36,7 +36,7 @@ import { PythonRuntime } from "./python-runtime.ts";
 import { resolvePlaywrightRuntime } from "./playwright-runtime.ts";
 
 import { exitTimezoneForEdit, handleUserApi, profileWithEdits, type ProfileRoster } from "./adspower-users.ts";
-import { proxyUrl } from "./proxy.ts";
+import { proxyDisplaySummary, proxyUrl } from "./proxy.ts";
 import { CloudProfileEditor } from "./cloud-profile-editor.ts";
 import {
   AGENT_CONTROL_MAX_MESSAGE_BYTES,
@@ -66,6 +66,8 @@ export interface DashboardServerOptions {
   cloudBrowser?: CloudBrowserLifecycle;
   mcpTunnel?: McpTunnelLifecycle;
   port?: number;
+  /** Optional fallback ports to try if the default loopback port is unavailable (e.g. Windows excluded ranges). */
+  fallbackPorts?: readonly number[];
   /**
    * Bind address. Loopback only by default — the dashboard and API are
    * unauthenticated and can start/stop browsers, so they must not be reachable
@@ -105,7 +107,7 @@ function renderProfileCard(store: ProfileStore, id: string): Response {
   // Same number the browser window title and identity bookmark show: the
   // operator's custom NO. first, the store serial as fallback.
   const no = profileDisplayNo(p.customNo, store.getSerial(id)) ?? "?";
-  const proxy = p.proxy ? `${p.proxy.type}://${p.proxy.host}:${p.proxy.port}` : "none";
+  const proxy = p.proxy ? proxyDisplaySummary(p.proxy) : "none";
   const title = `${p.name || "profile"} · #${no}`;
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
 <style>
@@ -270,6 +272,13 @@ export function serveDesktopAutomationApi(opts: Omit<DashboardServerOptions, "ho
   }
 }
 
+function isPortBindError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (code === "EADDRINUSE" || code === "EACCES") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /Failed to start server|EADDRINUSE|EACCES|Is port \d+ in use/i.test(message);
+}
+
 export function serveDashboard(opts: DashboardServerOptions) {
   const { launcher, store, port = 50400, hostname = "127.0.0.1" } = opts;
   const runtimeMode = opts.appConfig?.read().mode;
@@ -337,8 +346,15 @@ export function serveDashboard(opts: DashboardServerOptions) {
     // A user who already has a Python script gets the runtime before the first run.
     void library.list().then((items) => prefetchPythonFor(python, items), () => {});
   }
-  const server = Bun.serve<AgentSocketData>({
-    port,
+  const candidatePorts: number[] = [];
+  for (const candidate of [port, ...(opts.fallbackPorts ?? [])]) {
+    if (!Number.isInteger(candidate) || candidate < 0 || candidate > 65_535) continue;
+    if (!candidatePorts.includes(candidate)) candidatePorts.push(candidate);
+  }
+  if (candidatePorts.length === 0) candidatePorts.push(port);
+
+  const startOnPort = (candidatePort: number) => Bun.serve<AgentSocketData>({
+    port: candidatePort,
     hostname,
     // Queue wait plus a complete remote restore can legitimately hold a lifecycle
     // response for several minutes while the shared transition cap does its job.
@@ -424,6 +440,27 @@ export function serveDashboard(opts: DashboardServerOptions) {
       });
     },
   });
+
+  let server!: ReturnType<typeof startOnPort>;
+  let bound = false;
+  for (let i = 0; i < candidatePorts.length; i++) {
+    const candidatePort = candidatePorts[i]!;
+    try {
+      server = startOnPort(candidatePort);
+      bound = true;
+      break;
+    } catch (error) {
+      const hasFallback = i + 1 < candidatePorts.length;
+      if (hasFallback && isPortBindError(error)) continue;
+      const detail = error instanceof Error ? error.message : String(error);
+      log(`dashboard could not bind to http://${hostname}:${candidatePort}: ${detail} (try --port 15400 or set ALIASMODE_PORT)`);
+      throw error;
+    }
+  }
+  if (!bound) throw new Error(`dashboard could not bind to ${hostname}`);
+  if (port !== 0 && server.port !== port) {
+    log(`port ${port} is unavailable on ${hostname} (in use or reserved by OS); using fallback port ${server.port} instead (pass --port <n> to choose a fixed port)`);
+  }
   void agentHub?.cleanupTemporaryProfiles();
   log(`dashboard + API on http://${hostname}:${server.port}  (UI at /, AliasMode Local API under /api; AdsPower-compatible)`);
   return Object.assign(server, {

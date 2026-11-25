@@ -47,6 +47,8 @@ import {
 } from "./session.ts";
 import { importBuffers, importInbox, watchInbox } from "./inbox.ts";
 import { ensureStateDirectories, profileDataPaths, resolveStateRoot, statePaths, type StatePaths } from "./paths.ts";
+import { setSingBoxRuntimeRoot } from "./singbox-runtime.ts";
+import { setLocalNetworkStateRoot } from "./local-network.ts";
 import { migrateLegacyState, type LegacyMigrationResult, type MigrationOptions } from "./migration.ts";
 import {
   AppConfigStore,
@@ -145,14 +147,13 @@ export function selectedCloudUrl(
   return nonblank(env.ALIASMODE_CLOUD_URL) ?? config.cloudUrl ?? OFFICIAL_CLOUD_URL;
 }
 
-/** A person opening the desktop app starts on Cloud sign-in, so signing in
- *  needs no restart. Background (agent) launches stay Local. */
+/** Desktop first run starts directly in Local mode (with self-hosted WebDAV sync). */
 export function desktopFirstRunMode(
   desktop: boolean,
-  env: Record<string, string | undefined> = process.env,
+  _env: Record<string, string | undefined> = process.env,
 ): "local" | "cloud" | null {
   if (!desktop) return null;
-  return env.ALIASMODE_BACKGROUND === "1" ? "local" : "cloud";
+  return "local";
 }
 
 export function cloudRuntimeConfiguration(
@@ -2052,6 +2053,8 @@ function createCloudCrossDeviceSyntheticRuntime(
   device: CloudCrossDeviceFixtureDevice,
 ): CloudCrossDeviceSyntheticRuntime {
   ensureStateDirectories(paths);
+  setSingBoxRuntimeRoot(paths.browser);
+  setLocalNetworkStateRoot(paths.root);
   const store = new ProfileStore(paths.cloudDatabase);
   const queue = new PendingSyncQueue(
     paths.pendingSync,
@@ -2517,6 +2520,58 @@ function installFileLogging(root: string): void {
   }
 }
 
+/**
+ * Populate ALIASMODE_HOST_SCALE / ALIASMODE_HOST_SCREEN / ALIASMODE_HOST_AVAIL on Windows
+ * when running directly from the CLI (outside the Tauri desktop shell, which passes these
+ * from primary_monitor()). Without them, Chromium 155 defaults to --force-device-scale-factor=1
+ * and renders tiny on 125%-200% HiDPI displays.
+ */
+async function populateWindowsHostDisplayEnv(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  if (process.platform !== "win32") return;
+  if (env.ALIASMODE_HOST_SCALE && env.ALIASMODE_HOST_SCREEN && env.ALIASMODE_HOST_AVAIL) return;
+  try {
+    const { dlopen, FFIType, ptr } = await import("bun:ffi");
+    const u32 = dlopen("user32.dll", {
+      SetProcessDpiAwarenessContext: { args: [FFIType.i64], returns: FFIType.bool },
+      GetDpiForSystem: { args: [], returns: FFIType.u32 },
+      GetSystemMetrics: { args: [FFIType.i32], returns: FFIType.i32 },
+      SystemParametersInfoW: { args: [FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.bool },
+    });
+    try {
+      try { u32.symbols.SetProcessDpiAwarenessContext(-4n); } catch {}
+      const dpi = Number(u32.symbols.GetDpiForSystem());
+      const scale = dpi / 96;
+      if (!env.ALIASMODE_HOST_SCALE && Number.isFinite(scale) && scale >= 1 && scale <= 4) {
+        env.ALIASMODE_HOST_SCALE = String(scale);
+      }
+      const w = Number(u32.symbols.GetSystemMetrics(0));
+      const h = Number(u32.symbols.GetSystemMetrics(1));
+      if (!env.ALIASMODE_HOST_SCREEN && w >= 640 && h >= 480) {
+        env.ALIASMODE_HOST_SCREEN = `${w}x${h}`;
+      }
+      const rect = new Int32Array(4);
+      if (!env.ALIASMODE_HOST_AVAIL && u32.symbols.SystemParametersInfoW(0x0030, 0, ptr(rect), 0)) {
+        const aw = (rect[2] ?? 0) - (rect[0] ?? 0);
+        const ah = (rect[3] ?? 0) - (rect[1] ?? 0);
+        if (aw >= 640 && ah >= 480) env.ALIASMODE_HOST_AVAIL = `${aw}x${ah}`;
+      }
+    } finally {
+      u32.close();
+    }
+  } catch {
+    // Non-fatal: falls back to scale 1 when Windows DPI APIs are unavailable.
+  }
+}
+
+function startLocalSessionAutoCapture(launcher: Launcher, store: ProfileStore): void {
+  const timer = setInterval(() => {
+    for (const launch of store.listLaunches()) {
+      void launcher.captureLocalSession(launch.profileId).catch(() => {});
+    }
+  }, 180_000);
+  if (typeof timer === "object" && "unref" in timer) timer.unref();
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === CLOAKPIT_IMPORT_COMMAND) {
@@ -2560,6 +2615,8 @@ async function main() {
   const paths = statePaths(resolveStateRoot(rest));
   if (cmd === "setup") {
     ensureStateDirectories(paths);
+  setSingBoxRuntimeRoot(paths.browser);
+  setLocalNetworkStateRoot(paths.root);
     try {
       await setupSourceRuntime(paths.root);
     } catch (error) {
@@ -2581,6 +2638,9 @@ async function main() {
     }
   }
   const desktop = has(rest, "desktop-stdio");
+  if (!desktop && (cmd === "start" || cmd === "serve")) {
+    await populateWindowsHostDisplayEnv();
+  }
   // The desktop sidecar's stdout/stderr are discarded by the Tauri shell, which
   // made device-only failures undebuggable. Mirror every log line to a rotating
   // file under <state-root>/logs/ so a failed open can be diagnosed for real.
@@ -2595,6 +2655,8 @@ async function main() {
     ? new DesktopCredentialBridge(desktopHealth.instance)
     : null;
   ensureStateDirectories(paths);
+  setSingBoxRuntimeRoot(paths.browser);
+  setLocalNetworkStateRoot(paths.root);
   if (cmd === "__cloud-cross-device-acceptance") {
     const fixtureUrl = flag(rest, "fixture-url");
     if (!fixtureUrl) throw new Error("Cloud cross-device acceptance requires --fixture-url");
@@ -2717,7 +2779,9 @@ async function main() {
     }
     case "start": {
       const store = new ProfileStore(dbPath);
-      const port = Number(flag(rest, "port") ?? 50400);
+      const explicitPort = flag(rest, "port") ?? process.env.ALIASMODE_PORT;
+      const port = Number(explicitPort ?? 50400);
+      const fallbackPorts = explicitPort || desktopHealth ? undefined : [15400, 15401, 0];
 
       // Persisted mode is authoritative. The legacy HUB_URL fallback exists only
       // for existing installations that have not completed first-run selection.
@@ -2768,6 +2832,7 @@ async function main() {
           store,
           remote: coord,
           port,
+          fallbackPorts,
           lifecycleAdmission,
           appConfig,
           paths,
@@ -2778,6 +2843,7 @@ async function main() {
           health: desktopHealth,
           agentNonce: agentNonce ?? undefined,
         });
+        if (!desktopHealth && server.port) process.env.ALIASMODE_PORT = String(server.port);
 
         if (desktopHealth) {
           const assignedPort = server.port;
@@ -2862,6 +2928,7 @@ async function main() {
           launcher,
           store,
           port,
+          fallbackPorts,
           lifecycleAdmission,
           appConfig,
           paths,
@@ -2874,6 +2941,7 @@ async function main() {
           health: desktopHealth,
           agentNonce: agentNonce ?? undefined,
         });
+        if (!desktopHealth && server.port) process.env.ALIASMODE_PORT = String(server.port);
         mcpTunnel?.start();
         if (desktopHealth) {
           const assignedPort = server.port;
@@ -2920,6 +2988,7 @@ async function main() {
         launcher,
         store,
         port,
+        fallbackPorts,
         lifecycleAdmission,
         appConfig,
         paths,
@@ -2930,6 +2999,8 @@ async function main() {
         health: desktopHealth,
         agentNonce: agentNonce ?? undefined,
       });
+      if (!desktopHealth && server.port) process.env.ALIASMODE_PORT = String(server.port);
+      startLocalSessionAutoCapture(launcher, store);
       if (desktopHealth) {
         const assignedPort = server.port;
         if (!assignedPort) throw new Error("desktop sidecar did not receive a loopback port");
@@ -2953,10 +3024,12 @@ async function main() {
       startMemoryAttributionLog();
       prefetchBrowserRuntimes(launcher, store);
       if (cloudBrowser) installCloudShutdown(cloudBrowser);
-      serveDashboard({
+      const explicitPort = flag(rest, "port") ?? process.env.ALIASMODE_PORT;
+      const server = serveDashboard({
         launcher,
         store,
-        port: Number(flag(rest, "port") ?? 50400),
+        port: Number(explicitPort ?? 50400),
+        fallbackPorts: explicitPort ? undefined : [15400, 15401, 0],
         lifecycleAdmission,
         appConfig,
         paths,
@@ -2966,6 +3039,8 @@ async function main() {
         pendingSync,
         cloudBrowser,
       });
+      if (server.port) process.env.ALIASMODE_PORT = String(server.port);
+      if (savedMode.mode !== "cloud") startLocalSessionAutoCapture(launcher, store);
       break;
     }
     case "diagnose": {
@@ -3039,8 +3114,10 @@ async function main() {
 }
 
 export function runCli(): void {
-  main().catch(() => {
+  main().catch((error) => {
+    const code = (error as { code?: unknown } | null)?.code;
     console.error("[aliasmode] FATAL command failure");
+    if (typeof code === "string" && code) console.error(`[aliasmode] error code: ${code}`);
     process.exit(1);
   });
 }

@@ -1,9 +1,42 @@
+export type ParsedProxyType =
+  | "http"
+  | "socks5"
+  | "vless"
+  | "vmess"
+  | "trojan"
+  | "ss"
+  | "hysteria2"
+  | "tuic"
+  | "wireguard";
+
 export interface ParsedProxyInput {
-  type: "http" | "socks5";
+  type: ParsedProxyType;
   host: string;
   port: string;
   user: string;
   pass: string;
+  /** Present for sing-box protocol share URIs (vless://, vmess://, trojan://, ss://, hy2://, tuic://, wg://). */
+  uri?: string;
+  /** Optional remark / label parsed from the URI fragment or VMess ps field. */
+  label?: string;
+}
+
+const SINGBOX_SCHEME_MAP: Record<string, ParsedProxyType> = {
+  vless: "vless",
+  vmess: "vmess",
+  trojan: "trojan",
+  ss: "ss",
+  shadowsocks: "ss",
+  hysteria2: "hysteria2",
+  hy2: "hysteria2",
+  tuic: "tuic",
+  wireguard: "wireguard",
+  wg: "wireguard",
+};
+
+export function isSingBoxType(value: string): boolean {
+  const norm = value.trim().toLowerCase();
+  return Object.hasOwn(SINGBOX_SCHEME_MAP, norm);
 }
 
 function proxyType(value: string, fallback: "http" | "socks5"): "http" | "socks5" {
@@ -11,7 +44,7 @@ function proxyType(value: string, fallback: "http" | "socks5"): "http" | "socks5
   if (!normalized) return fallback;
   if (normalized === "socks" || normalized === "socks5") return "socks5";
   if (normalized === "http") return "http";
-  throw new Error(`unsupported proxy type “${normalized}” (use http or socks5)`);
+  throw new Error(`unsupported proxy type “${normalized}” (use http, socks5, or sing-box URI)`);
 }
 
 function decoded(value: string, label: string): string {
@@ -20,6 +53,22 @@ function decoded(value: string, label: string): string {
   } catch {
     throw new Error(`proxy ${label} has invalid percent-encoding`);
   }
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function decodeBase64Browser(raw: string): string {
+  const cleaned = raw.trim().replace(/-/g, "+").replace(/_/g, "/").replace(/\s+/g, "");
+  const padded = cleaned.length % 4 === 0 ? cleaned : cleaned + "=".repeat(4 - (cleaned.length % 4));
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 function isIpv6(value: string): boolean {
@@ -40,6 +89,84 @@ function validate(result: ParsedProxyInput): ParsedProxyInput {
   return { ...result, host: result.host.trim(), port: String(port) };
 }
 
+function parseSingBoxClientUri(raw: string, scheme: string): ParsedProxyInput {
+  const mapped = SINGBOX_SCHEME_MAP[scheme.toLowerCase()]!;
+  if (mapped === "vmess" && !raw.slice("vmess://".length).includes("@")) {
+    const payload = raw.slice("vmess://".length);
+    const hashIdx = payload.indexOf("#");
+    const b64 = hashIdx >= 0 ? payload.slice(0, hashIdx) : payload;
+    const hashLabel = hashIdx >= 0 ? safeDecode(payload.slice(hashIdx + 1)).trim() : "";
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(decodeBase64Browser(b64)) as Record<string, unknown>;
+    } catch {
+      throw new Error("invalid VMess base64 URI");
+    }
+    const host = String(json.add ?? "").trim().replace(/^\[|\]$/g, "");
+    const port = String(json.port ?? "").trim();
+    const label = String(json.ps ?? "").trim() || hashLabel;
+    return validate({
+      type: "vmess",
+      host,
+      port,
+      user: "",
+      pass: "",
+      uri: raw,
+      ...(label ? { label } : {}),
+    });
+  }
+
+  if (mapped === "ss") {
+    const after = raw.replace(/^(?:ss|shadowsocks):\/\//i, "");
+    const hashIdx = after.indexOf("#");
+    const label = hashIdx >= 0 ? safeDecode(after.slice(hashIdx + 1)).trim() : "";
+    const withoutHash = hashIdx >= 0 ? after.slice(0, hashIdx) : after;
+    const authority = withoutHash.split("?")[0]!;
+    let hostPort = "";
+    if (authority.includes("@")) {
+      hostPort = authority.slice(authority.lastIndexOf("@") + 1);
+    } else {
+      const dec = decodeBase64Browser(authority);
+      const atIdx = dec.lastIndexOf("@");
+      if (atIdx < 0) throw new Error("invalid Shadowsocks URI");
+      hostPort = dec.slice(atIdx + 1);
+    }
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(`http://${hostPort}`);
+    } catch {
+      throw new Error("invalid Shadowsocks host:port");
+    }
+    return validate({
+      type: "ss",
+      host: parsedUrl.hostname.replace(/^\[|\]$/g, ""),
+      port: parsedUrl.port,
+      user: "",
+      pass: "",
+      uri: raw,
+      ...(label ? { label } : {}),
+    });
+  }
+
+  let url: URL;
+  try {
+    url = new URL(raw.replace(/^hy2:\/\//i, "hysteria2://").replace(/^wg:\/\//i, "wireguard://"));
+  } catch {
+    throw new Error("invalid proxy URL");
+  }
+  const defaultPort = mapped === "wireguard" ? "51820" : mapped === "hysteria2" || mapped === "tuic" ? "443" : "";
+  const label = safeDecode(url.hash.replace(/^#/, "")).trim();
+  return validate({
+    type: mapped,
+    host: url.hostname.replace(/^\[|\]$/g, ""),
+    port: url.port || defaultPort,
+    user: "",
+    pass: "",
+    uri: raw,
+    ...(label ? { label } : {}),
+  });
+}
+
 /** Browser-side convenience parser; the API performs authoritative validation again. */
 export function parsePastedProxy(
   value: string,
@@ -47,7 +174,12 @@ export function parsePastedProxy(
 ): ParsedProxyInput {
   const raw = value.trim();
   if (!raw) throw new Error("paste a proxy first");
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+  const schemeMatch = raw.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+  if (schemeMatch) {
+    const scheme = schemeMatch[1]!.toLowerCase();
+    if (Object.hasOwn(SINGBOX_SCHEME_MAP, scheme)) {
+      return parseSingBoxClientUri(raw, scheme);
+    }
     let url: URL;
     try {
       url = new URL(raw);

@@ -955,8 +955,8 @@ test("CLI dispatches the session worker before normal command parsing", async ()
   ]);
 });
 
-test("desktop first run starts on Cloud sign-in; background and CLI runs do not", () => {
-  expect(desktopFirstRunMode(true, {})).toBe("cloud");
+test("desktop first run starts in Local mode (WebDAV sync); CLI runs stay unconfigured", () => {
+  expect(desktopFirstRunMode(true, {})).toBe("local");
   expect(desktopFirstRunMode(true, { ALIASMODE_BACKGROUND: "1" })).toBe("local");
   expect(desktopFirstRunMode(false, {})).toBeNull();
 });

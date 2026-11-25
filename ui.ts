@@ -34,6 +34,7 @@ import type { StatePaths } from "./paths.ts";
 import type { ChromiumRuntime, FingerprintVerdict, Profile, CookieRecord, ProxySpec } from "./types.ts";
 import { checkProxy as runProxyCheck, type ProxyCheckResult } from "./proxy-check.ts";
 import { handleProxyToolsRequest } from "./proxy-tools.ts";
+import { handleProxyPoolRequest } from "./proxy-pool.ts";
 import { handleTrashRequest } from "./trash.ts";
 import { importInbox, importBuffers, prepareImportBuffers, ProfileImportError, type ImportOverrides } from "./inbox.ts";
 import { hostChromiumRuntime, supportsChromium155Host } from "./aliasmode-chromium.ts";
@@ -59,7 +60,27 @@ import {
 } from "./extensions.ts";
 import { decodePortableProfile } from "./portable-profile.ts";
 import { isSafeProfileId, PROFILE_ID_ERROR } from "./profile-id.ts";
-import { normalizeProxySpec, proxyHostPort, proxyLegacyString, type ProxyInput } from "./proxy.ts";
+import { isSingBoxProxy, normalizeProxySpec, parseProxySpec, proxyDisplaySummary, proxyHostPort, proxyIdentityKey, proxyLegacyString, type ProxyInput } from "./proxy.ts";
+import {
+  buildClashTunRules,
+  buildClashVergeScript,
+  buildLocalClashProxySpec,
+  detectLocalClashProxies,
+  readLocalNetworkSettings,
+  writeLocalNetworkSettings,
+} from "./local-network.ts";
+import {
+  buildVpsWebDavDeployGuide,
+  executeWebDavSync,
+  previewWebDavSync,
+  readWebDavConfig,
+  saveWebDavConfig,
+  testWebDavConnection,
+  toPublicWebDavConfig,
+  type SyncConflictChoice,
+  type WebDavSyncConfigPatch,
+  type WebDavSyncMode,
+} from "./webdav-sync.ts";
 import { convertMobilePersonaToDesktop, editedProfileHardware, isMobileUserAgent } from "./fingerprint.ts";
 import { setFirefoxScreen, syncFirefoxTimezone } from "./firefox-config.ts";
 import { join, resolve, dirname } from "node:path";
@@ -166,7 +187,7 @@ export function listUiProfiles(store: ProfileStore): UiProfile[] {
       group: p.group,
       platform: p.platform ?? "",
       tags: p.tags ?? [],
-      proxy: p.proxy ? proxyHostPort(p.proxy) : null,
+      proxy: p.proxy ? (isSingBoxProxy(p.proxy) ? proxyDisplaySummary(p.proxy) : proxyHostPort(p.proxy)) : null,
       ...(p.proxyError ? { proxyError: p.proxyError } : {}),
       timezone: p.timezone,
       cookieCount: p.cookies.length,
@@ -445,6 +466,13 @@ function proxyCheckView(result: ProxyCheckResult): ProxyCheckResult {
     ...(result.country ? { country: result.country } : {}),
     ...(result.region ? { region: result.region } : {}),
     ...(result.city ? { city: result.city } : {}),
+    ...(result.isp ? { isp: result.isp } : {}),
+    ...(result.asn ? { asn: result.asn } : {}),
+    ...(result.ipType ? { ipType: result.ipType } : {}),
+    ...(typeof result.riskScore === "number" ? { riskScore: result.riskScore } : {}),
+    ...(result.riskLevel ? { riskLevel: result.riskLevel } : {}),
+    ...(Array.isArray(result.riskFlags) && result.riskFlags.length ? { riskFlags: result.riskFlags } : {}),
+    ...(typeof result.latencyMs === "number" ? { latencyMs: result.latencyMs } : {}),
     ...(result.rotating !== undefined ? { rotating: result.rotating } : {}),
   };
 }
@@ -486,13 +514,27 @@ function storedHardware(p: Profile): { gpu?: string; cores?: number } | undefine
 
 function profileEditView(p: Profile) {
   const px = p.proxy;
-  const proxy = px ? proxyLegacyString(px) : "";
+  const proxyMode: "direct" | "local-clash" | "node" = !px
+    ? "direct"
+    : px.mode === "local-clash"
+      ? "local-clash"
+      : "node";
+  const proxy = px && px.mode !== "local-clash" ? proxyLegacyString(px) : "";
+  const preProxyMode: "none" | "local-clash" | "node" = !px?.preProxy
+    ? "none"
+    : px.preProxy.mode === "local-clash"
+      ? "local-clash"
+      : "node";
+  const preProxy = px?.preProxy && px.preProxy.mode !== "local-clash" ? proxyLegacyString(px.preProxy) : "";
   const conversion = isMobileUserAgent(p.ua) ? convertMobilePersonaToDesktop(p) : null;
   return {
     id: p.id, name: p.name, engine: profileEngine(p), ...(p.chromiumRuntime ? { chromiumRuntime: p.chromiumRuntime } : {}),
     ...(storedHardware(p) ? { hardware: storedHardware(p) } : {}),
     group: p.group, platform: p.platform ?? "",
+    proxyMode,
     proxyType: px?.type ?? "http", proxy,
+    preProxyMode,
+    preProxyType: px?.preProxy?.type ?? "http", preProxy,
     ...(p.proxyError ? { proxyError: p.proxyError } : {}),
     username: p.username, password: p.password,
     email: p.email ?? "", emailPassword: p.emailPassword ?? "", twofa: p.twofa,
@@ -569,15 +611,47 @@ function applyEdits(p: Profile, set: Record<string, unknown>): boolean {
     if (hardware) p.hardware = hardware;
     else delete p.hardware;
   }
-  if ("proxy" in set) {
-    const nextProxy = parseStrictProxy(set.proxyType ?? p.proxy?.type ?? "http", set.proxy);
-    const previousProxy = p.proxy;
-    proxyChanged = !!p.proxyError ||
-      previousProxy?.type !== nextProxy?.type ||
-      previousProxy?.host !== nextProxy?.host ||
-      previousProxy?.port !== nextProxy?.port ||
-      previousProxy?.user !== nextProxy?.user ||
-      previousProxy?.pass !== nextProxy?.pass;
+  if ("proxyMode" in set || "proxy" in set || "preProxy" in set || "preProxyMode" in set) {
+    const previousKey = p.proxyError ? "__quarantined__" : proxyIdentityKey(p.proxy);
+    const requestedMode = typeof set.proxyMode === "string" ? set.proxyMode.trim().toLowerCase() : "";
+    let nextProxy: ProxySpec | null;
+    if (requestedMode === "direct") {
+      nextProxy = null;
+    } else if (requestedMode === "local-clash") {
+      nextProxy = buildLocalClashProxySpec();
+    } else {
+      nextProxy = "proxy" in set
+        ? (typeof set.proxy === "object" && set.proxy !== null
+            ? normalizeProxySpec(set.proxy as ProxyInput)
+            : parseStrictProxy(set.proxyType ?? p.proxy?.type ?? "http", set.proxy))
+        : p.proxy ? { ...p.proxy } : null;
+      const requestedPreMode = typeof set.preProxyMode === "string" ? set.preProxyMode.trim().toLowerCase() : "";
+      if (requestedPreMode === "none") {
+        if (nextProxy) {
+          const { preProxy: _removed, ...rest } = nextProxy;
+          nextProxy = normalizeProxySpec(rest);
+        }
+      } else if (requestedPreMode === "local-clash") {
+        if (!nextProxy) throw new Error("pre-proxy requires a primary proxy");
+        nextProxy = normalizeProxySpec({ ...nextProxy, preProxy: buildLocalClashProxySpec() });
+      } else if ("preProxy" in set) {
+        const nextPre = typeof set.preProxy === "object" && set.preProxy !== null
+          ? normalizeProxySpec(set.preProxy as ProxyInput)
+          : parseProxySpec(set.preProxyType ?? p.proxy?.preProxy?.type ?? "http", set.preProxy);
+        if (nextPre && !nextProxy) throw new Error("pre-proxy requires a primary proxy");
+        if (nextProxy) {
+          if (nextPre) nextProxy = normalizeProxySpec({ ...nextProxy, preProxy: nextPre });
+          else {
+            const { preProxy: _removed, ...rest } = nextProxy;
+            nextProxy = normalizeProxySpec(rest);
+          }
+        }
+      } else if (nextProxy && !nextProxy.preProxy && p.proxy?.preProxy && typeof set.proxy !== "object") {
+        // Preserve existing preProxy when only updating the primary proxy text without passing preProxy.
+        nextProxy = normalizeProxySpec({ ...nextProxy, preProxy: p.proxy.preProxy });
+      }
+    }
+    proxyChanged = previousKey !== proxyIdentityKey(nextProxy);
     p.proxy = nextProxy;
     delete p.proxyError;
   }
@@ -865,6 +939,113 @@ export async function handleUiRequest(
     return noStoreJson({ ok: true, hidden: config.servicesHidden === true });
   }
 
+  // Local 3-mode network routing settings (Local Clash proxy URL + TUN rules helper).
+  if (pathname === "/ui/api/network" && req.method === "GET") {
+    const root = options.paths?.root ?? APPLICATION_ROOT;
+    return noStoreJson({
+      ok: true,
+      settings: readLocalNetworkSettings(),
+      clashTunRules: buildClashTunRules(root),
+      clashVergeScript: buildClashVergeScript(root),
+    });
+  }
+
+  if (pathname === "/ui/api/network" && req.method === "POST") {
+    const rejected = rejectUntrustedJsonMutation(req);
+    if (rejected) return rejected;
+    try {
+      const body = (await req.json().catch(() => ({}))) as { localClashUrl?: unknown; routeNodesViaSingBox?: unknown };
+      const settings = writeLocalNetworkSettings({
+        ...(body.localClashUrl !== undefined ? { localClashUrl: String(body.localClashUrl) } : {}),
+        ...(typeof body.routeNodesViaSingBox === "boolean" ? { routeNodesViaSingBox: body.routeNodesViaSingBox } : {}),
+      });
+      const root = options.paths?.root ?? APPLICATION_ROOT;
+      return noStoreJson({
+        ok: true,
+        settings,
+        clashTunRules: buildClashTunRules(root),
+        clashVergeScript: buildClashVergeScript(root),
+      });
+    } catch (error) {
+      return noStoreJson({ ok: false, error: msg(error) }, 400);
+    }
+  }
+
+  if (pathname === "/ui/api/network/detect-clash" && req.method === "POST") {
+    const detected = await detectLocalClashProxies();
+    return noStoreJson({ ok: true, detected });
+  }
+
+  // Self-hosted E2EE WebDAV sync (replaces official AliasMode Cloud login).
+  if (pathname.startsWith("/ui/api/webdav")) {
+    const stateRoot = options.paths?.root ?? APPLICATION_ROOT;
+    const captureLiveSession = (profileId: string) => launcher.captureLocalSession(profileId);
+    try {
+      if (pathname === "/ui/api/webdav" && req.method === "GET") {
+        const config = readWebDavConfig(stateRoot);
+        return noStoreJson({
+          ok: true,
+          config: toPublicWebDavConfig(config),
+          deployGuide: buildVpsWebDavDeployGuide(),
+        });
+      }
+      if (pathname === "/ui/api/webdav" && req.method === "POST") {
+        const rejected = rejectUntrustedJsonMutation(req);
+        if (rejected) return rejected;
+        const patch = (await req.json().catch(() => ({}))) as WebDavSyncConfigPatch;
+        const saved = saveWebDavConfig(stateRoot, patch);
+        return noStoreJson({
+          ok: true,
+          config: toPublicWebDavConfig(saved),
+          deployGuide: buildVpsWebDavDeployGuide(),
+        });
+      }
+      if (pathname === "/ui/api/webdav/test" && req.method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as WebDavSyncConfigPatch;
+        const saved = readWebDavConfig(stateRoot);
+        const merged = {
+          ...saved,
+          ...(body.url !== undefined ? { url: String(body.url).trim() } : {}),
+          ...(body.username !== undefined ? { username: String(body.username).trim() } : {}),
+          ...(body.password !== undefined && body.password !== "" ? { password: String(body.password) } : {}),
+          ...(body.passphrase !== undefined && body.passphrase !== "" ? { passphrase: String(body.passphrase) } : {}),
+          ...(body.deviceName !== undefined && body.deviceName.trim() ? { deviceName: body.deviceName.trim() } : {}),
+        };
+        const result = await testWebDavConnection(merged);
+        return noStoreJson(result);
+      }
+      if (pathname === "/ui/api/webdav/preview" && req.method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { captureLive?: boolean };
+        const preview = await previewWebDavSync(stateRoot, store, { captureLiveSession }, {
+          captureLive: body?.captureLive !== false,
+        });
+        return noStoreJson(preview);
+      }
+      if (pathname === "/ui/api/webdav/sync" && req.method === "POST") {
+        const rejected = rejectUntrustedJsonMutation(req);
+        if (rejected) return rejected;
+        const body = (await req.json().catch(() => ({}))) as {
+          mode?: unknown;
+          resolutions?: Record<string, SyncConflictChoice>;
+          proxyPoolResolution?: SyncConflictChoice;
+        };
+        const mode: WebDavSyncMode = body.mode === "push" || body.mode === "pull" ? body.mode : "merge";
+        const result = await executeWebDavSync(stateRoot, store, {
+          mode,
+          resolutions: body.resolutions,
+          proxyPoolResolution: body.proxyPoolResolution,
+        }, { captureLiveSession });
+        return noStoreJson({
+          ...result,
+          config: toPublicWebDavConfig(readWebDavConfig(stateRoot)),
+        });
+      }
+      return noStoreJson({ ok: false, error: "Unknown WebDAV endpoint" }, 404);
+    } catch (error) {
+      return noStoreJson({ ok: false, error: msg(error) }, 400);
+    }
+  }
+
   if (pathname === "/ui/api/cloud-events" && req.method === "GET") {
     return Response.json(
       { events: normalizeCloudDiagnostics(options.cloudBrowser?.diagnostics?.() ?? []) },
@@ -890,7 +1071,7 @@ export async function handleUiRequest(
         throw new Error("invalid proxy input");
       }
       const normalized = normalizeProxySpec(body.proxy as ProxyInput);
-      if (!normalized || (normalized.type !== "http" && normalized.type !== "socks5")) {
+      if (!normalized || (!isSingBoxProxy(normalized) && normalized.type !== "http" && normalized.type !== "socks5")) {
         throw new Error("unsupported proxy input");
       }
       proxy = normalized;
@@ -898,7 +1079,7 @@ export async function handleUiRequest(
       return noStoreJson({ ok: false, error: "Invalid proxy settings" }, 400);
     }
     try {
-      const result = await (options.proxyCheck ?? runProxyCheck)(proxy);
+      const result = await (options.proxyCheck ?? ((p: ProxySpec) => runProxyCheck(p, { includeRisk: true })))(proxy);
       return noStoreJson({ ok: true, ...proxyCheckView(result) });
     } catch {
       return noStoreJson({ ok: false, error: "Proxy check failed" }, 500);
@@ -1434,6 +1615,15 @@ export async function handleUiRequest(
       { ok: false, error: "AliasMode Cloud authentication is required" },
       { status: 503 },
     );
+  }
+
+  if (pathname === "/ui/api/proxy-pool" || pathname.startsWith("/ui/api/proxy-pool/")) {
+    if (remote) return noStoreJson({ ok: false, error: "Proxy pool is unavailable in legacy remote mode" }, 400);
+    if (req.method !== "GET") {
+      const rejected = rejectUntrustedJsonMutation(req);
+      if (rejected) return rejected;
+    }
+    return handleProxyPoolRequest(req, store, launcher, options);
   }
 
   if (pathname.startsWith("/ui/api/proxies/")) {

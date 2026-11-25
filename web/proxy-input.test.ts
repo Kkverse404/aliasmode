@@ -37,3 +37,18 @@ test("proxy paste supports bracketed IPv6 and rejects malformed input", () => {
   expect(() => parsePastedProxy("proxy.example:not-a-port:user:pass", "http")).toThrow("invalid proxy port");
   expect(() => parsePastedProxy("https://u:p@proxy.example:8443", "http")).toThrow("unsupported proxy type");
 });
+
+test("proxy paste parses sing-box share URIs (vless, vmess, trojan, ss, hy2, tuic, wg)", () => {
+  const vless = parsePastedProxy("vless://11111111-1111-4111-8111-111111111111@node.example:443?security=reality&pbk=abc#US-1");
+  expect(vless).toMatchObject({ type: "vless", host: "node.example", port: "443", label: "US-1" });
+  expect(vless.uri).toContain("vless://");
+
+  const hy2 = parsePastedProxy("hy2://pw@hy.example:8443?sni=hy.example#JP");
+  expect(hy2).toMatchObject({ type: "hysteria2", host: "hy.example", port: "8443", label: "JP" });
+
+  const vmessPayload = Buffer.from(JSON.stringify({ v: "2", ps: "SG", add: "sg.example", port: 443, id: "uuid" })).toString("base64");
+  expect(parsePastedProxy(`vmess://${vmessPayload}`)).toMatchObject({ type: "vmess", host: "sg.example", port: "443", label: "SG" });
+
+  const ss = parsePastedProxy(`ss://${Buffer.from("aes-256-gcm:secret").toString("base64")}@ss.example:8388#HK`);
+  expect(ss).toMatchObject({ type: "ss", host: "ss.example", port: "8388", label: "HK" });
+});

@@ -25,5 +25,17 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  "exclude": [
+    "node_modules",
+    "profiles",
+    "runtimes",
+    "browser",
+    "cloud-cache",
+    "firefox-data",
+    "logs",
+    "reports",
+    "inbox",
+    "src-tauri/target"
+  ]
 }

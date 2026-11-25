@@ -19,7 +19,9 @@ import type {
   ObservedFingerprint,
   Profile,
   ProfileEngine,
+  ProxyPoolNode,
   ProxySpec,
+  ProxySubscription,
 } from "./types.ts";
 import { completeProfileFingerprint, normalizeChromiumRuntime, normalizeProfileEngine } from "./firefox-config.ts";
 import { normalizeProfileHardware } from "./fingerprint.ts";
@@ -174,6 +176,56 @@ export class ProfileStore {
         created_at INTEGER NOT NULL DEFAULT 0
       );
     `);
+    // Local proxy subscriptions and reusable node pool for sing-box & chained routing.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS proxy_subscriptions (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        url TEXT NOT NULL,
+        node_count INTEGER NOT NULL DEFAULT 0,
+        last_updated_at INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        user_info_json TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS proxy_nodes (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        subscription_id TEXT NOT NULL DEFAULT '',
+        proxy_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        last_status TEXT NOT NULL DEFAULT '',
+        last_reason TEXT NOT NULL DEFAULT '',
+        last_ip TEXT NOT NULL DEFAULT '',
+        last_country TEXT NOT NULL DEFAULT '',
+        last_city TEXT NOT NULL DEFAULT '',
+        last_isp TEXT NOT NULL DEFAULT '',
+        last_ip_type TEXT NOT NULL DEFAULT '',
+        last_risk_score INTEGER,
+        last_risk_level TEXT NOT NULL DEFAULT '',
+        last_risk_flags_json TEXT NOT NULL DEFAULT '[]',
+        last_latency_ms INTEGER,
+        last_checked_at INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    for (const col of [
+      "last_reason TEXT NOT NULL DEFAULT ''",
+      "last_city TEXT NOT NULL DEFAULT ''",
+      "last_isp TEXT NOT NULL DEFAULT ''",
+      "last_ip_type TEXT NOT NULL DEFAULT ''",
+      "last_risk_score INTEGER",
+      "last_risk_level TEXT NOT NULL DEFAULT ''",
+      "last_risk_flags_json TEXT NOT NULL DEFAULT '[]'",
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE proxy_nodes ADD COLUMN ${col}`);
+      } catch {
+        /* column already exists */
+      }
+    }
     // Migration for persisted browser-engine identity. Legacy profiles are Chromium.
     for (const col of [
       "engine TEXT NOT NULL DEFAULT 'chromium'",
@@ -1050,6 +1102,246 @@ export class ProfileStore {
       this.db.query(`DELETE FROM launches WHERE profile_id = ?`).run(profileId);
       this.completeClosedFingerprints(profileId);
     })();
+  }
+
+  // ---- Local proxy subscriptions & reusable node pool ----------------------
+
+  listProxySubscriptions(): ProxySubscription[] {
+    return this.db
+      .query<any, []>(`SELECT * FROM proxy_subscriptions ORDER BY created_at DESC, rowid DESC`)
+      .all()
+      .map(rowToProxySubscription);
+  }
+
+  getProxySubscription(id: string): ProxySubscription | null {
+    const row = this.db
+      .query<any, [string]>(`SELECT * FROM proxy_subscriptions WHERE id = ?`)
+      .get(id);
+    return row ? rowToProxySubscription(row) : null;
+  }
+
+  upsertProxySubscription(sub: ProxySubscription): void {
+    this.db.query(
+      `INSERT INTO proxy_subscriptions (id, name, url, node_count, last_updated_at, last_error, user_info_json, created_at)
+       VALUES ($id, $name, $url, $nodeCount, $lastUpdatedAt, $lastError, $userInfo, $createdAt)
+       ON CONFLICT(id) DO UPDATE SET
+         name=excluded.name, url=excluded.url, node_count=excluded.node_count,
+         last_updated_at=excluded.last_updated_at, last_error=excluded.last_error,
+         user_info_json=excluded.user_info_json`,
+    ).run({
+      $id: sub.id,
+      $name: sub.name,
+      $url: sub.url,
+      $nodeCount: sub.nodeCount,
+      $lastUpdatedAt: sub.lastUpdatedAt,
+      $lastError: sub.lastError,
+      $userInfo: sub.userInfo ? JSON.stringify(sub.userInfo) : "",
+      $createdAt: sub.createdAt || Date.now(),
+    });
+  }
+
+  deleteProxySubscription(id: string, removeNodes = true): boolean {
+    let deleted = false;
+    this.transaction(() => {
+      if (removeNodes) {
+        this.db.query(`DELETE FROM proxy_nodes WHERE subscription_id = ?`).run(id);
+      }
+      const res = this.db.query(`DELETE FROM proxy_subscriptions WHERE id = ?`).run(id);
+      deleted = res.changes > 0;
+    })();
+    return deleted;
+  }
+
+  listProxyNodes(subscriptionId?: string): ProxyPoolNode[] {
+    const rows = subscriptionId !== undefined
+      ? this.db.query<any, [string]>(`SELECT * FROM proxy_nodes WHERE subscription_id = ? ORDER BY created_at DESC, rowid ASC`).all(subscriptionId)
+      : this.db.query<any, []>(`SELECT * FROM proxy_nodes ORDER BY created_at DESC, rowid ASC`).all();
+    const out: ProxyPoolNode[] = [];
+    for (const row of rows) {
+      const node = rowToProxyNode(row);
+      if (node) out.push(node);
+    }
+    return out;
+  }
+
+  getProxyNode(id: string): ProxyPoolNode | null {
+    const row = this.db.query<any, [string]>(`SELECT * FROM proxy_nodes WHERE id = ?`).get(id);
+    return row ? rowToProxyNode(row) : null;
+  }
+
+  upsertProxyNode(node: ProxyPoolNode): void {
+    const normalized = normalizeProxySpec(node.proxy);
+    if (!normalized) throw new Error("proxy node requires a valid proxy");
+    this.db.query(
+      `INSERT INTO proxy_nodes
+         (id, name, subscription_id, proxy_json, tags_json, last_status, last_reason, last_ip, last_country, last_city, last_isp, last_ip_type, last_risk_score, last_risk_level, last_risk_flags_json, last_latency_ms, last_checked_at, created_at)
+       VALUES ($id, $name, $subId, $proxy, $tags, $status, $reason, $ip, $country, $city, $isp, $ipType, $riskScore, $riskLevel, $riskFlags, $latency, $checkedAt, $createdAt)
+       ON CONFLICT(id) DO UPDATE SET
+         name=excluded.name, subscription_id=excluded.subscription_id, proxy_json=excluded.proxy_json,
+         tags_json=excluded.tags_json, last_status=excluded.last_status, last_reason=excluded.last_reason,
+         last_ip=excluded.last_ip, last_country=excluded.last_country, last_city=excluded.last_city,
+         last_isp=excluded.last_isp, last_ip_type=excluded.last_ip_type, last_risk_score=excluded.last_risk_score,
+         last_risk_level=excluded.last_risk_level, last_risk_flags_json=excluded.last_risk_flags_json,
+         last_latency_ms=excluded.last_latency_ms, last_checked_at=excluded.last_checked_at`,
+    ).run({
+      $id: node.id,
+      $name: node.name,
+      $subId: node.subscriptionId ?? "",
+      $proxy: JSON.stringify(normalized),
+      $tags: JSON.stringify(node.tags ?? []),
+      $status: node.lastStatus ?? "",
+      $reason: node.lastReason ?? "",
+      $ip: node.lastIp ?? "",
+      $country: node.lastCountry ?? "",
+      $city: node.lastCity ?? "",
+      $isp: node.lastIsp ?? "",
+      $ipType: node.lastIpType ?? "",
+      $riskScore: node.lastRiskScore ?? null,
+      $riskLevel: node.lastRiskLevel ?? "",
+      $riskFlags: JSON.stringify(node.lastRiskFlags ?? []),
+      $latency: node.lastLatencyMs ?? null,
+      $checkedAt: node.lastCheckedAt ?? 0,
+      $createdAt: node.createdAt || Date.now(),
+    });
+  }
+
+  replaceSubscriptionNodes(subscriptionId: string, nodes: ProxyPoolNode[]): number {
+    let count = 0;
+    this.transaction(() => {
+      this.db.query(`DELETE FROM proxy_nodes WHERE subscription_id = ?`).run(subscriptionId);
+      for (const node of nodes) {
+        this.upsertProxyNode({ ...node, subscriptionId });
+        count++;
+      }
+      this.db.query(`UPDATE proxy_subscriptions SET node_count = ?, last_updated_at = ?, last_error = '' WHERE id = ?`)
+        .run(count, Date.now(), subscriptionId);
+    })();
+    return count;
+  }
+
+  deleteProxyNodes(ids: string[]): number {
+    if (!ids.length) return 0;
+    let deleted = 0;
+    this.transaction(() => {
+      const del = this.db.query(`DELETE FROM proxy_nodes WHERE id = ?`);
+      for (const id of ids) deleted += del.run(id).changes;
+      this.db.exec(`
+        UPDATE proxy_subscriptions
+        SET node_count = (SELECT COUNT(*) FROM proxy_nodes WHERE proxy_nodes.subscription_id = proxy_subscriptions.id)
+      `);
+    })();
+    return deleted;
+  }
+
+  /** Atomically replace the proxy subscriptions and node pool (used by WebDAV pull/sync). */
+  replaceProxyPool(subscriptions: ProxySubscription[], nodes: ProxyPoolNode[]): void {
+    this.transaction(() => {
+      this.db.exec(`DELETE FROM proxy_nodes; DELETE FROM proxy_subscriptions;`);
+      for (const sub of subscriptions) {
+        this.upsertProxySubscription(sub);
+      }
+      for (const node of nodes) {
+        this.upsertProxyNode(node);
+      }
+      this.db.exec(`
+        UPDATE proxy_subscriptions
+        SET node_count = (SELECT COUNT(*) FROM proxy_nodes WHERE proxy_nodes.subscription_id = proxy_subscriptions.id)
+      `);
+    })();
+  }
+
+  updateProxyNodeCheck(
+    id: string,
+    status: ProxyPoolNode["lastStatus"],
+    ip: string,
+    country: string,
+    latencyMs: number | null,
+    checkedAt = Date.now(),
+    meta?: {
+      reason?: string;
+      city?: string;
+      isp?: string;
+      ipType?: ProxyPoolNode["lastIpType"];
+      riskScore?: number | null;
+      riskLevel?: ProxyPoolNode["lastRiskLevel"];
+      riskFlags?: string[];
+    },
+  ): void {
+    this.db.query(
+      `UPDATE proxy_nodes
+       SET last_status = ?, last_reason = ?, last_ip = ?, last_country = ?, last_city = ?, last_isp = ?,
+           last_ip_type = ?, last_risk_score = ?, last_risk_level = ?, last_risk_flags_json = ?,
+           last_latency_ms = ?, last_checked_at = ?
+       WHERE id = ?`,
+    ).run(
+      status,
+      meta?.reason ?? "",
+      ip,
+      country,
+      meta?.city ?? "",
+      meta?.isp ?? "",
+      meta?.ipType ?? "",
+      meta?.riskScore ?? null,
+      meta?.riskLevel ?? "",
+      JSON.stringify(meta?.riskFlags ?? []),
+      latencyMs,
+      checkedAt,
+      id,
+    );
+  }
+}
+
+function rowToProxySubscription(row: any): ProxySubscription {
+  return {
+    id: String(row.id),
+    name: String(row.name ?? ""),
+    url: String(row.url ?? ""),
+    nodeCount: Number(row.node_count ?? 0),
+    lastUpdatedAt: Number(row.last_updated_at ?? 0),
+    lastError: String(row.last_error ?? ""),
+    ...optionalJson<ProxySubscription["userInfo"]>("userInfo", row.user_info_json),
+    createdAt: Number(row.created_at ?? 0),
+  };
+}
+
+function rowToProxyNode(row: any): ProxyPoolNode | null {
+  try {
+    const parsed = JSON.parse(String(row.proxy_json ?? "")) as ProxySpec;
+    const proxy = normalizeProxySpec(parsed);
+    if (!proxy) return null;
+    const status = String(row.last_status ?? "");
+    const lastStatus = (status === "working" || status === "unstable" || status === "failed" || status === "unavailable" ? status : "") as ProxyPoolNode["lastStatus"];
+    const riskLevelRaw = String(row.last_risk_level ?? "");
+    const lastRiskLevel = (riskLevelRaw === "low" || riskLevelRaw === "medium" || riskLevelRaw === "high" ? riskLevelRaw : "") as NonNullable<ProxyPoolNode["lastRiskLevel"]>;
+    const ipTypeRaw = String(row.last_ip_type ?? "");
+    const lastIpType = (
+      ipTypeRaw === "residential" || ipTypeRaw === "mobile" || ipTypeRaw === "datacenter"
+      || ipTypeRaw === "vpn" || ipTypeRaw === "proxy" || ipTypeRaw === "tor" || ipTypeRaw === "unknown"
+        ? ipTypeRaw
+        : ""
+    ) as NonNullable<ProxyPoolNode["lastIpType"]>;
+    return {
+      id: String(row.id),
+      name: String(row.name ?? ""),
+      subscriptionId: String(row.subscription_id ?? ""),
+      proxy,
+      tags: safeParse<string[]>(row.tags_json, []),
+      lastStatus,
+      lastReason: String(row.last_reason ?? ""),
+      lastIp: String(row.last_ip ?? ""),
+      lastCountry: String(row.last_country ?? ""),
+      lastCity: String(row.last_city ?? ""),
+      lastIsp: String(row.last_isp ?? ""),
+      lastIpType,
+      lastRiskScore: row.last_risk_score == null ? null : Number(row.last_risk_score),
+      lastRiskLevel,
+      lastRiskFlags: safeParse<string[]>(row.last_risk_flags_json, []),
+      lastLatencyMs: row.last_latency_ms == null ? null : Number(row.last_latency_ms),
+      lastCheckedAt: Number(row.last_checked_at ?? 0),
+      createdAt: Number(row.created_at ?? 0),
+    };
+  } catch {
+    return null;
   }
 }
 

@@ -14,7 +14,7 @@ import type { Profile, ProfileEngine, ProxySpec } from "./types.ts";
 import { completeProfileFingerprint, createFirefoxProfileConfig, normalizeChromiumRuntime, syncFirefoxTimezone } from "./firefox-config.ts";
 import { chromiumDeviceScale, defaultChromiumRuntime, hostDisplayScale, hostDisplaySize } from "./aliasmode-chromium.ts";
 import { deterministicSeed, generateProfileHardware, hostPlatformOs } from "./fingerprint.ts";
-import { normalizeProxySpec } from "./proxy.ts";
+import { normalizeProxySpec, type ProxyInput } from "./proxy.ts";
 import { isFirefoxAddonId } from "./extensions.ts";
 import { parseStrictCustomNo, parseStrictResolution, parsePlatformOs } from "./parse.ts";
 
@@ -32,7 +32,7 @@ export interface NewProfileInput {
   email?: string;
   emailPassword?: string;
   twofa?: string;
-  proxy?: { type?: string; host?: string; port?: string; user?: string; pass?: string } | null;
+  proxy?: ProxyInput | null;
   /**
    * "1920x1080" / "1920*1080"; empty → this computer's display for Firefox, else a random realistic
    * resolution no smaller than that display.

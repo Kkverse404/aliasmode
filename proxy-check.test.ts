@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { fetchDirectEgressTimed, measureHttp204Latency } from "./egress.ts";
 import {
   checkProxy,
   classifyProxyAttempts,
@@ -250,4 +251,147 @@ test("proxy check rejects blank and unsupported proxy input before network activ
   await expect(checkProxy({ type: "https", host: "proxy.example", port: "8443" })).rejects.toThrow(
     "use http or socks5",
   );
+});
+
+test("fetchDirectEgressTimed does not accumulate failed/429 endpoint wait time into fallback latency", async () => {
+  const result = await fetchDirectEgressTimed(
+    { endpoints: ["https://slow-429.test/ip", "https://fast-ok.test/ip"], timeoutMs: 2_000 },
+    (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("slow-429")) {
+        await Bun.sleep(120);
+        return new Response("rate limited", { status: 429 });
+      }
+      await Bun.sleep(5);
+      return Response.json({ ip: "203.0.113.88", country: "JP" });
+    }) as unknown as typeof fetch,
+  );
+  expect(result.info).toEqual({ ip: "203.0.113.88", country: "JP" });
+  expect(typeof result.latencyMs).toBe("number");
+  expect(result.latencyMs!).toBeLessThan(90);
+});
+
+test("measureHttp204Latency falls back cleanly without accumulating failed endpoint delay and short-circuits 407", async () => {
+  let cfHits = 0;
+  const probe = await measureHttp204Latency(
+    (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("gstatic.com")) {
+        await Bun.sleep(120);
+        return new Response("blocked", { status: 503 });
+      }
+      cfHits++;
+      await Bun.sleep(cfHits === 1 ? 35 : 5);
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof fetch,
+  );
+  expect(probe.endpoint).toBe("http://cp.cloudflare.com/generate_204");
+  expect(cfHits).toBe(2); // 1 warmup + 1 timed probe
+  expect(probe.latencyMs).not.toBeNull();
+  expect(probe.latencyMs!).toBeLessThan(80);
+
+  let authCalls = 0;
+  const authFail = await measureHttp204Latency(
+    (async () => {
+      authCalls++;
+      return new Response("proxy auth required", { status: 407 });
+    }) as unknown as typeof fetch,
+  );
+  expect(authFail).toEqual({ latencyMs: null, authenticationFailed: true });
+  expect(authCalls).toBe(1);
+});
+
+test("checkProxy reuses a single sing-box relay and decouples 204 latency from slow egress IP lookup", async () => {
+  let specRelaysOpened = 0;
+  let specRelaysClosed = 0;
+  const seenUrls: string[] = [];
+  const seenPorts = new Set<string>();
+
+  const result = await checkProxy(
+    { uri: "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443?security=tls#US-1" },
+    {
+      direct,
+      specRelayFactory: async () => {
+        specRelaysOpened++;
+        return {
+          port: 45100 + specRelaysOpened,
+          close: () => { specRelaysClosed++; },
+        };
+      },
+      fetchFn: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const proxy = (init as RequestInit & { proxy?: string } | undefined)?.proxy;
+        if (proxy) seenPorts.add(proxy);
+        seenUrls.push(url);
+        if (url.includes("generate_204")) {
+          await Bun.sleep(5);
+          return new Response(null, { status: 204 });
+        }
+        // Simulate slow cross-ocean ipinfo.io TLS + JSON response
+        await Bun.sleep(160);
+        return Response.json({ ip: "198.51.100.42", country: "US", city: "San Jose" });
+      }) as unknown as typeof fetch,
+    },
+  );
+
+  // Must open and close ONLY ONE sing-box relay (never 3!)
+  expect(specRelaysOpened).toBe(1);
+  expect(specRelaysClosed).toBe(1);
+  expect(seenPorts.size).toBe(1);
+  expect(result).toMatchObject({
+    status: "working",
+    attempts: 3,
+    successes: 3,
+    ip: "198.51.100.42",
+    country: "US",
+    city: "San Jose",
+    rotating: false,
+  });
+  // Latency must reflect the fast 204 Anycast probe, NOT the 160ms egress lookup!
+  expect(seenUrls.some((u) => u.includes("www.gstatic.com/generate_204"))).toBe(true);
+  expect(typeof result.latencyMs).toBe("number");
+  expect(result.latencyMs!).toBeLessThan(120);
+});
+
+test("single-attempt pool mode reuses 1 relay for 204 probe + 1 egress lookup only", async () => {
+  let relaysOpened = 0;
+  let relaysClosed = 0;
+  let egressCalls = 0;
+  let probe204Calls = 0;
+
+  const result = await checkProxy(
+    { uri: "trojan://secret@node.example.com:443#JP-1" },
+    {
+      attempts: 1,
+      reuseRelay: true,
+      measureLatency: true,
+      direct,
+      specRelayFactory: async () => {
+        relaysOpened++;
+        return { port: 46100, close: () => { relaysClosed++; } };
+      },
+      fetchFn: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("generate_204")) {
+          probe204Calls++;
+          return new Response(null, { status: 204 });
+        }
+        egressCalls++;
+        return Response.json({ ip: "203.0.113.99", country: "JP" });
+      }) as unknown as typeof fetch,
+    },
+  );
+
+  expect(relaysOpened).toBe(1);
+  expect(relaysClosed).toBe(1);
+  expect(probe204Calls).toBe(2); // 1 warmup + 1 timed 204 on same relay
+  expect(egressCalls).toBe(1);   // 1 egress lookup only (not 3)
+  expect(result).toMatchObject({
+    status: "working",
+    attempts: 1,
+    successes: 1,
+    ip: "203.0.113.99",
+    country: "JP",
+  });
+  expect(result.latencyMs).toBeGreaterThanOrEqual(1);
 });

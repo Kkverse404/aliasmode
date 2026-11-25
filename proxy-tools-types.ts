@@ -41,6 +41,13 @@ export interface ProxyCheckView {
   reason?: string;
   ip?: string;
   country?: string;
+  city?: string;
+  isp?: string;
+  ipType?: ProxyCheckResult["ipType"];
+  riskScore?: number;
+  riskLevel?: ProxyCheckResult["riskLevel"];
+  riskFlags?: string[];
+  latencyMs?: number;
   checkedAt: number;
 }
 

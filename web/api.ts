@@ -719,11 +719,291 @@ export async function deleteProfiles(ids: string[]): Promise<any> {
 
 export interface ProxyCheckInput {
   type?: string;
-  host: string;
-  port: string;
+  host?: string;
+  port?: string;
   user?: string;
   pass?: string;
+  uri?: string;
+  label?: string;
+  mode?: "local-clash";
+  preProxy?: ProxyCheckInput | null;
 }
+
+export interface SingBoxKernelStatusView {
+  installed: boolean;
+  version: string;
+  path: string | null;
+  source: "env" | "managed" | "path" | null;
+  supported: boolean;
+  installing: boolean;
+}
+
+export interface ProxySubscriptionView {
+  id: string;
+  name: string;
+  url: string;
+  nodeCount: number;
+  lastUpdatedAt: number;
+  lastError: string;
+  userInfo?: { upload?: number; download?: number; total?: number; expire?: number };
+  createdAt: number;
+}
+
+export interface ProxyPoolNodeView {
+  id: string;
+  name: string;
+  subscriptionId: string;
+  type: string;
+  host: string;
+  port: string;
+  summary: string;
+  hasChain: boolean;
+  value: string;
+  proxy: ProxyCheckInput;
+  tags: string[];
+  lastStatus: "" | "working" | "unstable" | "failed" | "unavailable";
+  lastReason: string;
+  lastIp: string;
+  lastCountry: string;
+  lastCity: string;
+  lastIsp: string;
+  lastIpType: "" | IpNetworkType;
+  lastRiskScore: number | null;
+  lastRiskLevel: "" | IpRiskLevel;
+  lastRiskFlags: string[];
+  lastLatencyMs: number | null;
+  lastCheckedAt: number;
+  createdAt: number;
+}
+
+export interface ProxyPoolState {
+  kernel: SingBoxKernelStatusView;
+  subscriptions: ProxySubscriptionView[];
+  nodes: ProxyPoolNodeView[];
+}
+
+export async function fetchProxyPool(): Promise<ProxyPoolState> {
+  const path = "/ui/api/proxy-pool";
+  const response = await fetch(path, { cache: "no-store" });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Proxy pool is unavailable");
+  return {
+    kernel: body.kernel as SingBoxKernelStatusView,
+    subscriptions: Array.isArray(body.subscriptions) ? body.subscriptions : [],
+    nodes: Array.isArray(body.nodes) ? body.nodes : [],
+  };
+}
+
+export async function installSingBoxKernel(): Promise<SingBoxKernelStatusView> {
+  const path = "/ui/api/proxy-pool/kernel/install";
+  const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "sing-box install failed");
+  return body.kernel as SingBoxKernelStatusView;
+}
+
+export async function addProxySubscription(input: { name?: string; url: string; useLocalClash?: boolean }): Promise<{
+  subscription: ProxySubscriptionView;
+  imported: number;
+  skipped: number;
+  format: string;
+}> {
+  const path = "/ui/api/proxy-pool/subscriptions";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not add subscription");
+  return body;
+}
+
+export async function refreshProxySubscription(id: string, useLocalClash = false): Promise<{
+  subscription: ProxySubscriptionView;
+  imported: number;
+  preserved?: number;
+  skipped: number;
+  format: string;
+}> {
+  const path = `/ui/api/proxy-pool/subscriptions/${encodeURIComponent(id)}/refresh`;
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(useLocalClash ? { useLocalClash: true } : {}),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not refresh subscription");
+  return body;
+}
+
+export async function deleteProxySubscription(id: string): Promise<void> {
+  const path = `/ui/api/proxy-pool/subscriptions/${encodeURIComponent(id)}`;
+  const response = await fetch(path, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: "{}" });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not delete subscription");
+}
+
+export async function importProxyPoolNodes(input: string, tags?: string[]): Promise<{
+  imported: number;
+  duplicates: number;
+  skipped: number;
+  format: string;
+}> {
+  const path = "/ui/api/proxy-pool/nodes/import";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input, ...(tags?.length ? { tags } : {}) }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not import nodes");
+  return body;
+}
+
+export async function deleteProxyPoolNodes(ids: string[]): Promise<number> {
+  const path = "/ui/api/proxy-pool/nodes/delete";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not delete nodes");
+  return Number(body.deleted ?? 0);
+}
+
+export interface ProxyPoolCheckResultItemView {
+  id: string;
+  status: ProxyPoolNodeView["lastStatus"];
+  reason: string;
+  ip: string;
+  country: string;
+  city: string;
+  isp: string;
+  ipType: "" | IpNetworkType;
+  riskScore: number | null;
+  riskLevel: "" | IpRiskLevel;
+  riskFlags: string[];
+  latencyMs: number | null;
+  checkedAt: number;
+}
+
+export type ProxyPoolCheckStreamEventView =
+  | { type: "progress"; completed: number; total: number }
+  | { type: "result"; item: ProxyPoolCheckResultItemView }
+  | { type: "done"; completed: number; total: number; cancelled: boolean }
+  | { type: "error"; error: string };
+
+export async function checkProxyPoolNodes(
+  ids?: string[],
+  preProxyNodeId?: string,
+  includeRisk = true,
+): Promise<ProxyPoolCheckResultItemView[]> {
+  const path = "/ui/api/proxy-pool/nodes/check";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...(ids?.length ? { ids } : {}),
+      ...(preProxyNodeId ? { preProxyNodeId } : {}),
+      includeRisk,
+    }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not check nodes");
+  return body.results ?? [];
+}
+
+/** Stream NDJSON node pool check progress and per-node results with AbortSignal cancellation. */
+export async function streamCheckProxyPoolNodes(
+  input: { ids?: string[]; preProxyNodeId?: string; includeRisk?: boolean },
+  onEvent: (event: ProxyPoolCheckStreamEventView) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const path = "/ui/api/proxy-pool/nodes/check";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
+    body: JSON.stringify({
+      ...(input.ids?.length ? { ids: input.ids } : {}),
+      ...(input.preProxyNodeId ? { preProxyNodeId: input.preProxyNodeId } : {}),
+      includeRisk: input.includeRisk !== false,
+      stream: true,
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    const body = await apiJson(response, path);
+    throw new Error(body.error || "Could not check nodes");
+  }
+  if (!response.body || !response.headers.get("content-type")?.includes("application/x-ndjson")) {
+    const body = await apiJson(response, path);
+    if (body.ok !== true) throw new Error(body.error || "Could not check nodes");
+    const list: ProxyPoolCheckResultItemView[] = Array.isArray(body.results) ? body.results : [];
+    list.forEach((item, idx) => {
+      onEvent({ type: "result", item });
+      onEvent({ type: "progress", completed: idx + 1, total: list.length });
+    });
+    onEvent({ type: "done", completed: list.length, total: list.length, cancelled: false });
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let done = false;
+  const abort = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", abort, { once: true });
+  const accept = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as ProxyPoolCheckStreamEventView;
+    if (event.type === "error") throw new Error(event.error || "Node check failed");
+    if (event.type === "done") done = true;
+    onEvent(event);
+  };
+  try {
+    while (true) {
+      if (signal?.aborted) throw new DOMException("Cancelled", "AbortError");
+      const chunk = await reader.read();
+      if (signal?.aborted) throw new DOMException("Cancelled", "AbortError");
+      if (chunk.done) break;
+      pending += decoder.decode(chunk.value, { stream: true });
+      let end: number;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        accept(pending.slice(0, end));
+        pending = pending.slice(end + 1);
+      }
+    }
+    pending += decoder.decode();
+    if (pending.trim()) accept(pending);
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    if (!done) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+export async function assignProxyPoolNodes(input: {
+  scope: { all?: boolean; groups?: string[]; ids?: string[] };
+  nodeIds: string[];
+  preProxyNodeId?: string;
+  profilesPerNode?: number;
+  skipFailed?: boolean;
+}): Promise<{ assigned: number; skipped: number; failed: number; skippedFailedNodes?: number }> {
+  const path = "/ui/api/proxy-pool/assign";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not assign proxy nodes");
+  return body;
+}
+
+export type IpRiskLevel = "low" | "medium" | "high";
+export type IpNetworkType = "residential" | "mobile" | "datacenter" | "vpn" | "proxy" | "tor" | "unknown";
 
 export type ProxyCheckStatus = "working" | "unstable" | "failed" | "unavailable";
 export type ProxyCheckReason =
@@ -745,6 +1025,13 @@ export interface ProxyCheckResult {
   country?: string;
   region?: string;
   city?: string;
+  isp?: string;
+  asn?: string;
+  ipType?: IpNetworkType;
+  riskScore?: number;
+  riskLevel?: IpRiskLevel;
+  riskFlags?: string[];
+  latencyMs?: number;
   rotating?: boolean;
 }
 
@@ -759,6 +1046,8 @@ const PROXY_CHECK_REASONS = new Set<ProxyCheckReason>([
   "proxy_bypassed",
   "check_unavailable",
 ]);
+const IP_RISK_LEVELS = new Set<IpRiskLevel>(["low", "medium", "high"]);
+const IP_NETWORK_TYPES = new Set<IpNetworkType>(["residential", "mobile", "datacenter", "vpn", "proxy", "tor", "unknown"]);
 
 function proxyCheckResult(body: any): ProxyCheckResult {
   if (
@@ -769,7 +1058,12 @@ function proxyCheckResult(body: any): ProxyCheckResult {
     || body.successes < 0
     || body.successes > body.attempts
     || (body.reason !== undefined && !PROXY_CHECK_REASONS.has(body.reason))
-    || ["ip", "country", "region", "city"].some((field) => body[field] !== undefined && typeof body[field] !== "string")
+    || ["ip", "country", "region", "city", "isp", "asn"].some((field) => body[field] !== undefined && typeof body[field] !== "string")
+    || (body.ipType !== undefined && !IP_NETWORK_TYPES.has(body.ipType))
+    || (body.riskLevel !== undefined && !IP_RISK_LEVELS.has(body.riskLevel))
+    || (body.riskScore !== undefined && (typeof body.riskScore !== "number" || !Number.isFinite(body.riskScore)))
+    || (body.riskFlags !== undefined && (!Array.isArray(body.riskFlags) || body.riskFlags.some((f: unknown) => typeof f !== "string")))
+    || (body.latencyMs !== undefined && (typeof body.latencyMs !== "number" || !Number.isFinite(body.latencyMs)))
     || (body.rotating !== undefined && typeof body.rotating !== "boolean")
   ) {
     throw new Error("Proxy check returned invalid data");
@@ -783,6 +1077,13 @@ function proxyCheckResult(body: any): ProxyCheckResult {
     ...(body.country ? { country: body.country } : {}),
     ...(body.region ? { region: body.region } : {}),
     ...(body.city ? { city: body.city } : {}),
+    ...(body.isp ? { isp: body.isp } : {}),
+    ...(body.asn ? { asn: body.asn } : {}),
+    ...(body.ipType ? { ipType: body.ipType } : {}),
+    ...(typeof body.riskScore === "number" ? { riskScore: body.riskScore } : {}),
+    ...(body.riskLevel ? { riskLevel: body.riskLevel } : {}),
+    ...(Array.isArray(body.riskFlags) && body.riskFlags.length ? { riskFlags: body.riskFlags } : {}),
+    ...(typeof body.latencyMs === "number" ? { latencyMs: body.latencyMs } : {}),
     ...(body.rotating !== undefined ? { rotating: body.rotating } : {}),
   };
 }
@@ -854,9 +1155,14 @@ export interface EditProfile {
   hardware?: { gpu?: string; cores?: number };
   group: string;
   platform: string;
+  proxyMode?: "direct" | "local-clash" | "node";
   proxyType: string;
-  /** Full "host:port[:user:pass]". */
+  /** Full "host:port[:user:pass]" or sing-box share URI. */
   proxy: string;
+  preProxyMode?: "none" | "local-clash" | "node";
+  preProxyType?: string;
+  /** Optional upstream transit proxy ("host:port[:user:pass]" or sing-box share URI). */
+  preProxy?: string;
   proxyError?: string;
   username: string;
   password: string;
@@ -1250,4 +1556,219 @@ export async function stopAgentConversation(id: string): Promise<AgentConversati
 
 export async function deleteAgentConversation(id: string): Promise<void> {
   await agentRequest(`/ui/api/agent/conversations/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
+}
+
+// ---- Local 3-mode network routing (Direct / Local Clash / Proxy Node) ------------
+
+export interface LocalNetworkSettingsView {
+  localClashUrl: string;
+  routeNodesViaSingBox: boolean;
+}
+
+export interface DetectedLocalProxyView {
+  port: number;
+  url: string;
+  hint: string;
+}
+
+export async function fetchLocalNetwork(): Promise<{
+  settings: LocalNetworkSettingsView;
+  clashTunRules: string;
+  clashVergeScript: string;
+}> {
+  const path = "/ui/api/network";
+  const response = await fetch(path, { cache: "no-store" });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Network settings unavailable");
+  return {
+    settings: body.settings as LocalNetworkSettingsView,
+    clashTunRules: String(body.clashTunRules ?? ""),
+    clashVergeScript: String(body.clashVergeScript ?? ""),
+  };
+}
+
+export async function saveLocalNetwork(
+  patch: Partial<LocalNetworkSettingsView>,
+): Promise<{
+  settings: LocalNetworkSettingsView;
+  clashTunRules: string;
+  clashVergeScript: string;
+}> {
+  const path = "/ui/api/network";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not save network settings");
+  return {
+    settings: body.settings as LocalNetworkSettingsView,
+    clashTunRules: String(body.clashTunRules ?? ""),
+    clashVergeScript: String(body.clashVergeScript ?? ""),
+  };
+}
+
+export async function detectLocalClash(): Promise<DetectedLocalProxyView[]> {
+  const path = "/ui/api/network/detect-clash";
+  const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Port scan failed");
+  return Array.isArray(body.detected) ? body.detected : [];
+}
+
+// ---- Self-hosted encrypted WebDAV sync ------------------------------------------
+
+export interface WebDavSyncPublicConfigView {
+  enabled: boolean;
+  configured: boolean;
+  url: string;
+  username: string;
+  hasPassword: boolean;
+  hasPassphrase: boolean;
+  deviceName: string;
+  lastSyncAt: number;
+  lastSyncMessage: string;
+}
+
+export interface WebDavSyncConfigPatchInput {
+  enabled?: boolean;
+  url?: string;
+  username?: string;
+  password?: string;
+  passphrase?: string;
+  deviceName?: string;
+  clearCredentials?: boolean;
+}
+
+export type SyncItemActionView =
+  | "push_create"
+  | "push_update"
+  | "push_delete"
+  | "pull_create"
+  | "pull_update"
+  | "pull_delete"
+  | "conflict"
+  | "unchanged";
+
+export interface SyncProfileDiffItemView {
+  id: string;
+  name: string;
+  group: string;
+  action: SyncItemActionView;
+  localExists: boolean;
+  remoteExists: boolean;
+  remoteDeleted?: boolean;
+  localOpen?: boolean;
+  remoteName?: string;
+  remoteUpdatedAt?: number;
+  remoteDevice?: string;
+}
+
+export interface SyncProxyPoolDiffView {
+  action: "push" | "pull" | "conflict" | "unchanged";
+  localSubscriptions: number;
+  localNodes: number;
+  remoteSubscriptions: number;
+  remoteNodes: number;
+  remoteUpdatedAt?: number;
+  remoteDevice?: string;
+}
+
+export interface WebDavSyncPreviewView {
+  ok: true;
+  remoteInitialized: boolean;
+  remoteUpdatedAt: number;
+  remoteUpdatedBy: string;
+  profiles: SyncProfileDiffItemView[];
+  proxyPool: SyncProxyPoolDiffView;
+  summary: { push: number; pull: number; conflicts: number; unchanged: number };
+}
+
+export type SyncConflictChoiceView = "local" | "remote" | "skip";
+export type WebDavSyncModeView = "merge" | "push" | "pull";
+
+export interface WebDavSyncRunResultView {
+  ok: true;
+  mode: WebDavSyncModeView;
+  pushed: number;
+  pulled: number;
+  deletedLocal: number;
+  deletedRemote: number;
+  proxyPoolAction: "pushed" | "pulled" | "unchanged" | "skipped";
+  skippedOpen: string[];
+  unresolvedConflicts: string[];
+  syncedAt: number;
+  message: string;
+  config: WebDavSyncPublicConfigView;
+}
+
+export async function fetchWebDavSync(): Promise<{ config: WebDavSyncPublicConfigView; deployGuide: string }> {
+  const path = "/ui/api/webdav";
+  const response = await fetch(path, { cache: "no-store" });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "WebDAV config unavailable");
+  return {
+    config: body.config as WebDavSyncPublicConfigView,
+    deployGuide: String(body.deployGuide ?? ""),
+  };
+}
+
+export async function saveWebDavSync(
+  patch: WebDavSyncConfigPatchInput,
+): Promise<{ config: WebDavSyncPublicConfigView; deployGuide: string }> {
+  const path = "/ui/api/webdav";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "Could not save WebDAV settings");
+  return {
+    config: body.config as WebDavSyncPublicConfigView,
+    deployGuide: String(body.deployGuide ?? ""),
+  };
+}
+
+export async function testWebDavSync(
+  patch: WebDavSyncConfigPatchInput,
+): Promise<{ ok: true; remoteInitialized: boolean; profileCount: number; remoteUpdatedAt: number; remoteUpdatedBy: string }> {
+  const path = "/ui/api/webdav/test";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "WebDAV connection test failed");
+  return body;
+}
+
+export async function previewWebDavSyncApi(captureLive = true): Promise<WebDavSyncPreviewView> {
+  const path = "/ui/api/webdav/preview";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ captureLive }),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "WebDAV diff preview failed");
+  return body;
+}
+
+export async function runWebDavSyncApi(input: {
+  mode: WebDavSyncModeView;
+  resolutions?: Record<string, SyncConflictChoiceView>;
+  proxyPoolResolution?: SyncConflictChoiceView;
+}): Promise<WebDavSyncRunResultView> {
+  const path = "/ui/api/webdav/sync";
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = await apiJson(response, path);
+  if (!response.ok || body.ok !== true) throw new Error(body.error || "WebDAV sync failed");
+  return body;
 }

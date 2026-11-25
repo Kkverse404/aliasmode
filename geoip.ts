@@ -1,7 +1,9 @@
 /** Best-effort import- and launch-time timezone enrichment and shared SOCKS5 tunneling. */
 
 import { connect as netConnect, type Socket } from "node:net";
-import { startProxyRelay, type ProxyRelay } from "./proxy-relay.ts";
+import { resolveRuntimeProxy } from "./local-network.ts";
+import { proxyIdentityKey } from "./proxy.ts";
+import { startProxyRelayForSpec, type ProxyRelay } from "./proxy-relay.ts";
 import type { ProxySpec } from "./types.ts";
 import { localeForCountry, localeForTimezone } from "./profile-locale.ts";
 import { canonicalIp } from "./ip.ts";
@@ -130,13 +132,7 @@ export async function lookupExitLocation(
   let relay: ProxyRelay | undefined;
   try {
     if (proxy) {
-      relay = await startProxyRelay({
-        type: proxy.type === "socks5" ? "socks5" : "http",
-        host: proxy.host,
-        port: Number(proxy.port),
-        user: proxy.user,
-        pass: proxy.pass,
-      });
+      relay = await startProxyRelayForSpec(proxy);
     }
     const init = {
       ...(relay ? { proxy: `http://127.0.0.1:${relay.port}` } : {}),
@@ -189,12 +185,13 @@ export async function lookupProxyExitLocation(
   proxy: ProxySpec,
   opts: { fetchFn?: FetchLike; waitMs?: number; now?: () => number } = {},
 ): Promise<ExitLocation | null> {
+  const resolvedProxy = resolveRuntimeProxy(proxy) ?? proxy;
   const now = opts.now ?? Date.now;
-  const key = JSON.stringify([proxy.type, proxy.host, String(proxy.port), proxy.user ?? "", proxy.pass ?? ""]);
+  const key = proxyIdentityKey(resolvedProxy);
   let entry = exits.get(key);
   if (!entry || now() - entry.at >= EXIT_REUSE_MS) {
     for (const [old, value] of exits) if (now() - value.at >= EXIT_REUSE_MS) exits.delete(old);
-    const created = { at: now(), location: lookupExitLocation(proxy, opts.fetchFn) };
+    const created = { at: now(), location: lookupExitLocation(resolvedProxy, opts.fetchFn) };
     exits.set(key, created);
     void created.location.then((location) => { if (!location && exits.get(key) === created) exits.delete(key); });
     entry = created;

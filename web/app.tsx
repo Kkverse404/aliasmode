@@ -8,13 +8,14 @@ import "./agent.css";
 import "./support.css";
 import { AgentHost } from "./agent.tsx";
 import { HeartIcon, SupportPanel, SupportPromptCard, SupporterBadge, DEFAULT_SUPPORT_CENTS, isActiveSupporter, supportBonusCents, supporterOf, tiersOf, useSupportPrompt, useSupportStatus, type SupportSource } from "./support.tsx";
-import { ProxiesPage } from "./proxies.tsx";
+import { ProxiesPage, formatPoolPickerOption, sortNodesForPicker } from "./proxies.tsx";
+import { LocalNetworkPanel, WebDavSyncPanel } from "./webdav-sync.tsx";
 import { ServicesPage } from "./services.tsx";
 import { CartIcon, ProxyProviderOffer, ProxyStoreContext, proxyOfferUrl, type ProxySrc } from "./proxy-offer.tsx";
 import { StorePage, useCloudStore } from "./store.tsx";
 import { trackStoreEvent, useStoreEvents } from "./store-events.ts";
 import { TrashPage } from "./trash.tsx";
-import { parsePastedProxy } from "./proxy-input.ts";
+import { isSingBoxType, parsePastedProxy } from "./proxy-input.ts";
 import { ScriptRunPanel, ScriptsPage } from "./scripts.tsx";
 import { I18nProvider, availableLanguages, languageNativeName, useTranslation } from "./i18n.tsx";
 import { localeTimezoneMismatch } from "../profile-locale.ts";
@@ -70,9 +71,15 @@ import {
   fetchLogs,
   fetchDiagnose,
   checkProxy,
+  fetchLocalNetwork,
+  fetchProxyPool,
+  fetchWebDavSync,
   ProxyCheckError,
+  type LocalNetworkSettingsView,
   type ProxyCheckInput,
   type ProxyCheckResult,
+  type ProxyPoolNodeView,
+  type WebDavSyncPublicConfigView,
   addProfileCookies,
   fetchPendingCookies,
   clearPendingCookies,
@@ -161,7 +168,7 @@ const REFRESH_MS = 3000;
 const PROFILE_PAGE_SIZE = 50;
 const PAGE_SIZES = [25, 50, 100, 200];
 
-const PAGE_TITLES: Record<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash" | "services" | "agent", string> = {
+const PAGE_TITLES: Record<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash" | "services" | "agent" | "sync", string> = {
   profiles: "Profiles",
   scripts: "Scripts",
   settings: "Settings",
@@ -170,11 +177,11 @@ const PAGE_TITLES: Record<"profiles" | "scripts" | "settings" | "extensions" | "
   trash: "Trash",
   services: "Services",
   agent: "Agent",
+  sync: "WebDAV Sync",
 };
 
 const SETTINGS_TABS = [
-  { key: "account", label: "Account" },
-  { key: "team", label: "Workspace" },
+  { key: "account", label: "WebDAV Sync & Network" },
   { key: "advanced", label: "Advanced" },
 ] as const;
 
@@ -1141,7 +1148,11 @@ async function storeDesktopCloudCredentials(
 }
 
 const BLANK_FORM = {
-  name: "", engine: "chromium" as "chromium" | "firefox", chromiumRuntime: "" as "" | "aliasmode", group: "", platform: "", proxyType: "http", host: "", port: "", user: "", pass: "",
+  name: "", engine: "chromium" as "chromium" | "firefox", chromiumRuntime: "" as "" | "aliasmode", group: "", platform: "",
+  proxyMode: "direct" as "direct" | "local-clash" | "node",
+  proxyType: "http", host: "", port: "", user: "", pass: "", uri: "",
+  preProxyMode: "none" as "none" | "local-clash" | "node",
+  preProxyType: "http", preProxy: "",
   screen: "", platformOs: "", customNo: "", username: "", password: "", email: "", emailPassword: "", twofa: "",
 };
 
@@ -1187,13 +1198,32 @@ function ProxyCheckFeedback({ hasProxy, state }: { hasProxy: boolean; state: Pro
   // A profile that already has a proxy keeps the offer, so it also shows in Edit profile.
   if (!result) return <ProxyProviderOffer placement="profile-dialog" />;
   const location = [result.city, result.region, result.country].filter(Boolean).join(", ");
-  const exit = [result.ip ? `Exit IP: ${result.ip}` : "", location].filter(Boolean).join(" · ");
+  const riskText = result.riskScore != null && result.riskLevel
+    ? [
+        result.riskLevel === "low" ? t("Low risk") : result.riskLevel === "medium" ? t("Medium risk") : t("High risk"),
+        `${result.riskScore}/100`,
+        result.ipType === "residential" ? t("Residential")
+          : result.ipType === "mobile" ? t("Mobile")
+          : result.ipType === "datacenter" ? t("Datacenter")
+          : result.ipType === "vpn" ? t("VPN")
+          : result.ipType === "proxy" ? t("Proxy IP")
+          : result.ipType === "tor" ? t("Tor")
+          : "",
+      ].filter(Boolean).join(" · ")
+    : "";
+  const exit = [
+    result.ip ? `${t("Exit IP")}: ${result.ip}` : "",
+    location,
+    result.latencyMs != null ? `${result.latencyMs} ms` : "",
+    riskText,
+    result.isp || "",
+  ].filter(Boolean).join(" · ");
   if (result.status === "working") {
     return (
       <>
         <div className="proxy-check-result working" role="status">
           <Icon name="check" className="sm" />
-          <span><strong>{t("Proxy is working.")}</strong>{exit && <> {exit}.</>}{result.rotating && <> Rotating exit IPs detected.</>}</span>
+          <span><strong>{t("Proxy is working.")}</strong>{exit && <> {exit}.</>}{result.rotating && <> {t("Rotating exit IPs detected.")}</>}</span>
         </div>
         <ProxyProviderOffer placement="profile-dialog" />
       </>
@@ -1204,7 +1234,7 @@ function ProxyCheckFeedback({ hasProxy, state }: { hasProxy: boolean; state: Pro
       <>
         <div className="proxy-check-result unstable" role="status">
           <Icon name="warning" className="sm" />
-          <span><strong>{t("Proxy checks were mixed.")}</strong> {result.successes} of {result.attempts} succeeded.</span>
+          <span><strong>{t("Proxy checks were mixed.")}</strong> {result.successes} of {result.attempts} succeeded.{exit && <> {exit}.</>}</span>
         </div>
         <ProxyProviderOffer placement="profile-dialog-check-failed" replacement />
       </>
@@ -1270,7 +1300,9 @@ function App() {
   // "profiles" is the roster; "settings" replaces it in the same content area
   // rather than opening a dialog — Settings outgrew a modal. New profile and
   // Edit stay dialogs: short forms, and a page felt like too much ceremony.
-  const [view, setView] = useState<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash" | "services" | "agent">("profiles");
+  const [view, setView] = useState<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash" | "services" | "agent" | "sync">("profiles");
+  const [webdavConfig, setWebdavConfig] = useState<WebDavSyncPublicConfigView | null>(null);
+  const [localNetwork, setLocalNetwork] = useState<LocalNetworkSettingsView>({ localClashUrl: "http://127.0.0.1:7897", routeNodesViaSingBox: true });
   const [scriptRunOpen, setScriptRunOpen] = useState(false);
   const [scriptRunProfiles, setScriptRunProfiles] = useState<UiProfile[]>([]);
   const [showCreate, setShowCreate] = useState(false);
@@ -1363,12 +1395,13 @@ function App() {
   const [pendingView, setPendingView] = useState<{ profile: UiProfile; cookies: Array<{ domain: string; name: string }> | null; error: string | null; busy: boolean } | null>(null);
   const [proxyPaste, setProxyPaste] = useState("");
   const [proxyPasteOk, setProxyPasteOk] = useState<string | null>(null);
+  const [poolPickerNodes, setPoolPickerNodes] = useState<ProxyPoolNodeView[]>([]);
   // Edit modal + bulk export/update + group rename
   const [editId, setEditId] = useState<string | null>(null);
   const [editExpectedVersion, setEditExpectedVersion] = useState<number | null>(null);
   const [editForm, setEditForm] = useState<Record<string, string>>({});
   const [editInitialFingerprint, setEditInitialFingerprint] = useState<Record<string, string>>({});
-  const [editInitialProxy, setEditInitialProxy] = useState({ proxy: "", proxyType: "http" });
+  const [editInitialProxy, setEditInitialProxy] = useState({ proxyMode: "direct", proxy: "", proxyType: "http", preProxyMode: "none", preProxy: "", preProxyType: "http" });
   const [outreachOfferDismissed, setOutreachOfferDismissed] = useState(() => {
     try { return localStorage.getItem("aliasmode.offers.xreacherDismissed") === "1"; } catch { return false; }
   });
@@ -1439,11 +1472,11 @@ function App() {
   const restoreInFlight = useRef(false);
   const savedSessionRestoreEnabled = useRef(true);
   const desktopUpdateCheckStarted = useRef(false);
-  const isCloudMode = appMode?.mode === "cloud";
+  const isCloudMode = false;
   // Profiles that need a proxy. Local mode only: a Cloud profile shows no
   // proxy until its encrypted payload is fetched, so the count would be wrong.
   const profilesWithoutProxy = isCloudMode ? 0 : profiles.filter((p) => !p.proxy?.trim()).length;
-  const workspaceReady = appMode?.mode === "local" || (isCloudMode && cloudWorkspaceReady(cloudAuth));
+  const workspaceReady = !!appMode;
   const canEditCloud = !isCloudMode || cloudAuth?.workspace?.role === "owner" || cloudAuth?.workspace?.role === "admin" ||
     team?.folders.some((folder) => folder.permission === "edit" && !folder.archivedAt) === true;
   const canManageCloudFolders = cloudAuth?.workspace?.role === "owner" || cloudAuth?.workspace?.role === "admin";
@@ -2130,12 +2163,21 @@ function App() {
 
   useEffect(() => {
     fetchAppMode().then((config) => {
-      setAppMode(config);
-      setRestartRequired(config.restartRequired === true);
+      // Official Cloud login is replaced by self-hosted WebDAV sync; always run the local workspace directly.
+      if (config.mode !== "local" && !config.legacyRemote) {
+        setAppMode({ ...config, mode: "local" });
+        setRestartRequired(false);
+        void selectAppMode("local").catch(() => {});
+      } else {
+        setAppMode(config);
+        setRestartRequired(config.restartRequired === true);
+      }
     }).catch((error) => {
       setConnErr(String(error));
       setLoaded(true);
     });
+    fetchWebDavSync().then((res) => setWebdavConfig(res.config)).catch(() => {});
+    fetchLocalNetwork().then((res) => setLocalNetwork(res.settings)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -2384,10 +2426,16 @@ function App() {
 
   const editSerial = editId ? profiles.find((profile) => profile.id === editId)?.serial ?? null : null;
   const editRunning = editId ? profiles.find((profile) => profile.id === editId)?.running === true : false;
-  const createHasProxy = !!(form.host.trim() || form.port.trim() || form.user.trim() || form.pass);
-  const editHasProxy = !!(editForm.proxy ?? "").trim();
-  const editProxyChanged = (editForm.proxy ?? "") !== editInitialProxy.proxy ||
-    (editHasProxy && editForm.proxyType !== editInitialProxy.proxyType);
+  const createHasProxy = form.proxyMode === "local-clash"
+    || (form.proxyMode === "node" && !!(form.uri.trim() || form.host.trim() || form.port.trim() || form.user.trim() || form.pass));
+  const editHasProxy = editForm.proxyMode === "local-clash"
+    || (editForm.proxyMode !== "direct" && !!(editForm.proxy ?? "").trim());
+  const editProxyChanged = (editForm.proxyMode ?? "direct") !== editInitialProxy.proxyMode
+    || (editForm.proxy ?? "") !== editInitialProxy.proxy
+    || (editHasProxy && editForm.proxyMode === "node" && editForm.proxyType !== editInitialProxy.proxyType)
+    || (editForm.preProxyMode ?? "none") !== editInitialProxy.preProxyMode
+    || (editForm.preProxy ?? "") !== editInitialProxy.preProxy
+    || (!!(editForm.preProxy ?? "").trim() && editForm.preProxyType !== editInitialProxy.preProxyType);
 
   const pastedRecordCount = bulkText.trim() ? countPastedRecords(bulkText) : null;
 
@@ -2726,19 +2774,27 @@ function App() {
   const setF = (k: keyof typeof BLANK_FORM, v: string) => {
     if (k === "proxyType" || k === "host" || k === "port" || k === "user" || k === "pass") {
       resetCreateProxyCheck();
+    } else if (k === "uri" || k === "preProxy" || k === "preProxyType" || k === "proxyMode" || k === "preProxyMode") {
+      resetCreateProxyCheck();
     }
     setForm((f) => ({ ...f, [k]: v }));
   };
+  const loadPoolNodesForPicker = () => {
+    if (appMode?.legacyRemote) return;
+    fetchProxyPool().then((state) => setPoolPickerNodes(state.nodes)).catch(() => {});
+    fetchLocalNetwork().then((res) => setLocalNetwork(res.settings)).catch(() => {});
+  };
+  const sortedPickerNodes = useMemo(() => sortNodesForPicker(poolPickerNodes), [poolPickerNodes]);
   // Open prefilled with the folder you're browsing; close always resets so a
   // cancelled draft never leaks into the next open.
   const openCreate = () => {
     resetCreateProxyCheck();
+    loadPoolNodesForPicker();
     setForm({ ...BLANK_FORM, engine: appMode?.defaultEngine ?? "chromium", chromiumRuntime: appMode?.defaultChromiumRuntime ?? "", group: group !== "all" && (!isCloudMode || editableGroups.includes(group)) ? group : "" });
     setProxyPaste("");
     setProxyPasteOk(null);
     setCreateErr(null);
-    // A first profile needs no proxy, so the section starts closed until profiles use one.
-    setCreateProxyOpen(profiles.some((profile) => !!profile.proxy));
+    setCreateProxyOpen(true);
     setShowCreate(true);
   };
   const closeCreate = () => {
@@ -2755,11 +2811,13 @@ function App() {
       resetCreateProxyCheck();
       setForm((current) => ({
         ...current,
+        proxyMode: "node",
         proxyType: parsed.type,
         host: parsed.host,
         port: parsed.port,
         user: parsed.user,
         pass: parsed.pass,
+        uri: parsed.uri ?? "",
       }));
       setProxyPaste("");
       setProxyPasteOk(`✓ ${parsed.type.toUpperCase()} proxy fields filled`);
@@ -2769,20 +2827,48 @@ function App() {
       setCreateErr(error instanceof Error ? error.message : String(error));
     }
   };
-  const checkCreateProxy = async () => {
-    const generation = ++createProxyCheckGeneration.current;
-    if (form.proxyType === "https") {
-      setCreateProxyCheck({ checking: false, result: null, error: "unavailable" });
-      return;
+  const buildCreateProxyPayload = (): ProxyCheckInput | null => {
+    if (form.proxyMode === "direct") return null;
+    if (form.proxyMode === "local-clash") return { mode: "local-clash" };
+    const preRaw = form.preProxy.trim();
+    const preProxy: ProxyCheckInput | null = form.preProxyMode === "local-clash"
+      ? { mode: "local-clash" }
+      : form.preProxyMode === "node" && preRaw
+        ? parsePastedProxy(preRaw, form.preProxyType === "socks5" ? "socks5" : "http")
+        : null;
+    if (isSingBoxType(form.proxyType) || form.uri.trim()) {
+      const uri = form.uri.trim();
+      if (!uri) return null;
+      const parsed = parsePastedProxy(uri);
+      return { ...parsed, ...(preProxy ? { preProxy } : {}) };
     }
-    setCreateProxyCheck({ checking: true, result: null, error: null });
-    const proxy: ProxyCheckInput = {
+    if (!form.host.trim()) return null;
+    return {
       type: form.proxyType,
       host: form.host,
       port: form.port,
       user: form.user,
       pass: form.pass,
+      ...(preProxy ? { preProxy } : {}),
     };
+  };
+  const checkCreateProxy = async () => {
+    const generation = ++createProxyCheckGeneration.current;
+    if (form.proxyMode === "node" && form.proxyType === "https" && form.preProxyMode === "none") {
+      setCreateProxyCheck({ checking: false, result: null, error: "unavailable" });
+      return;
+    }
+    setCreateProxyCheck({ checking: true, result: null, error: null });
+    let proxy: ProxyCheckInput | null;
+    try {
+      proxy = buildCreateProxyPayload();
+      if (!proxy) throw new Error("invalid");
+    } catch {
+      if (generation === createProxyCheckGeneration.current) {
+        setCreateProxyCheck({ checking: false, result: null, error: "invalid" });
+      }
+      return;
+    }
     try {
       const result = await checkProxy(proxy);
       if (generation === createProxyCheckGeneration.current) {
@@ -2802,6 +2888,7 @@ function App() {
     setCreating(true);
     setCreateErr(null);
     try {
+      const proxyPayload = createHasProxy ? buildCreateProxyPayload() : null;
       const r = await createProfile({
         name: form.name,
         engine: form.engine,
@@ -2816,7 +2903,7 @@ function App() {
         email: form.email,
         emailPassword: form.emailPassword,
         twofa: form.twofa,
-        proxy: form.host.trim() ? { type: form.proxyType, host: form.host, port: form.port, user: form.user, pass: form.pass } : null,
+        proxy: proxyPayload,
       });
       if (r.ok) {
         closeCreate();
@@ -2840,6 +2927,9 @@ function App() {
     if (k === "proxy" || k === "proxyType") {
       resetEditProxyCheck();
       setTimezoneBusy(false);
+    } else if (k === "preProxy" || k === "preProxyType" || k === "proxyMode" || k === "preProxyMode") {
+      resetEditProxyCheck();
+      setTimezoneBusy(false);
     }
     setEditForm((f) => ({ ...f, [k]: v }));
   };
@@ -2847,6 +2937,7 @@ function App() {
   // The ref discards a stale response if the operator has moved on meanwhile.
   const openEdit = (id: string) => {
     resetEditProxyCheck();
+    loadPoolNodesForPicker();
     setActionErr(null);
     editFetchId.current = id;
     setEditId(id);
@@ -2867,9 +2958,14 @@ function App() {
       try {
         const p: EditProfile = await fetchProfileEdit(id);
         if (editFetchId.current !== id) return;
+        const resolvedProxyMode = p.proxyMode ?? (p.proxy ? "node" : "direct");
+        const resolvedPreProxyMode = p.preProxyMode ?? (p.preProxy ? "node" : "none");
         setEditForm({
           name: p.name, group: p.group, platform: p.platform,
+          proxyMode: resolvedProxyMode,
           proxyType: p.proxyType || "http", proxy: p.proxy,
+          preProxyMode: resolvedPreProxyMode,
+          preProxyType: p.preProxyType || "http", preProxy: p.preProxy ?? "",
           proxyError: p.proxyError ?? "",
           username: p.username, password: p.password,
           email: p.email, emailPassword: p.emailPassword, twofa: p.twofa,
@@ -2881,7 +2977,14 @@ function App() {
           cores: p.cores ?? "",
           fingerprintSeed: p.fingerprintSeed ?? "",
         });
-        setEditInitialProxy({ proxy: p.proxy, proxyType: p.proxyType || "http" });
+        setEditInitialProxy({
+          proxyMode: resolvedProxyMode,
+          proxy: p.proxy,
+          proxyType: p.proxyType || "http",
+          preProxyMode: resolvedPreProxyMode,
+          preProxy: p.preProxy ?? "",
+          preProxyType: p.preProxyType || "http",
+        });
         setEditInitialFingerprint({
           resolution: p.resolution, platformOs: p.platformOs ?? "", timezone: p.timezone ?? "",
           locale: p.locale ?? "", cores: p.cores ?? "", fingerprintSeed: p.fingerprintSeed ?? "",
@@ -2921,15 +3024,29 @@ function App() {
   };
   const checkEditedProxy = async () => {
     const generation = ++editProxyCheckGeneration.current;
+    const mode = editForm.proxyMode ?? "node";
+    if (mode === "direct") return;
     const value = editForm.proxy ?? "";
-    if (editForm.proxyType === "https" || /^\s*https:\/\//i.test(value)) {
+    const preMode = editForm.preProxyMode ?? "none";
+    const preValue = (editForm.preProxy ?? "").trim();
+    if (mode === "node" && preMode === "none" && (editForm.proxyType === "https" || /^\s*https:\/\//i.test(value))) {
       setEditProxyCheck({ checking: false, result: null, error: "unavailable" });
       return;
     }
     setEditProxyCheck({ checking: true, result: null, error: null });
     let proxy: ProxyCheckInput;
     try {
-      proxy = parsePastedProxy(value, editForm.proxyType === "socks5" ? "socks5" : "http");
+      if (mode === "local-clash") {
+        proxy = { mode: "local-clash" };
+      } else {
+        const parsed = parsePastedProxy(value, editForm.proxyType === "socks5" ? "socks5" : "http");
+        const preProxy: ProxyCheckInput | null = preMode === "local-clash"
+          ? { mode: "local-clash" }
+          : preMode === "node" && preValue
+            ? parsePastedProxy(preValue, editForm.preProxyType === "socks5" ? "socks5" : "http")
+            : null;
+        proxy = { ...parsed, ...(preProxy ? { preProxy } : {}) };
+      }
     } catch {
       if (generation === editProxyCheckGeneration.current) {
         setEditProxyCheck({ checking: false, result: null, error: "invalid" });
@@ -2981,7 +3098,12 @@ function App() {
       if (isCloudMode && !editLive && editExpectedVersion === null) throw new Error("Cloud profile version is missing; close and reopen Edit");
       const r = await updateProfile(editId, {
         name: editForm.name ?? "", group: editForm.group ?? "", platform: editForm.platform ?? "",
-        proxy: editForm.proxy ?? "", proxyType: editForm.proxyType ?? "http",
+        proxyMode: editForm.proxyMode ?? "direct",
+        proxy: editForm.proxyMode === "node" ? (editForm.proxy ?? "") : "",
+        proxyType: editForm.proxyType ?? "http",
+        preProxyMode: editForm.proxyMode === "node" ? (editForm.preProxyMode ?? "none") : "none",
+        preProxy: editForm.proxyMode === "node" && editForm.preProxyMode === "node" ? (editForm.preProxy ?? "") : "",
+        preProxyType: editForm.preProxyType ?? "http",
         username: editForm.username ?? "", password: editForm.password ?? "",
         email: editForm.email ?? "", emailPassword: editForm.emailPassword ?? "", twofa: editForm.twofa ?? "",
         tags: editForm.tags ?? "", ...fingerprintEdits,
@@ -3611,9 +3733,16 @@ function App() {
             <Icon name="puzzle" /><span className="navlabel">{t("Manage extensions")}</span>
             {extensions.length > 0 && <span className="cnt">{extensions.length}</span>}
           </button>
-          {!appMode?.servicesHidden && <button type="button" className={`navitem${view === "services" ? " active" : ""}`} data-tip={t("Services")} title={t("Services")} onClick={() => setView("services")}>
-            <Icon name="services" /><span className="navlabel">{t("Services")}</span>
-          </button>}
+          <button
+            type="button"
+            className={`navitem${view === "sync" ? " active" : ""}`}
+            data-tip={t("WebDAV Sync")}
+            title={t("WebDAV Sync")}
+            onClick={() => setView("sync")}
+          >
+            <Icon name="cloud" /><span className="navlabel">{t("WebDAV Sync")}</span>
+            {webdavConfig?.configured && <span className="cnt">●</span>}
+          </button>
         </nav>
 
         <div className="sidesection">
@@ -3696,48 +3825,9 @@ function App() {
         </div>
 
         <div className="sidefoot">
-          <button type="button" className={`navitem support-nav${supporter?.tier ? ` tier-${supporter.tier}` : ""}`} data-tip={t("Support AliasMode")} title={t("Support AliasMode")}
-            onClick={() => setSupportSource("sidebar")}>
-            <HeartIcon filled={!!supporter?.tier} /><span className="navlabel">{t("Support AliasMode")}</span>
-          </button>
-          <a
-            className="navitem"
-            href="https://aliasmode.com/support/"
-            target="_blank"
-            rel="noreferrer"
-            data-tip={t("Support")}
-            title={t("Support — chat with the AliasMode team")}
-          >
-            <Icon name="help" /><span className="navlabel">{t("Support")}</span>
-          </a>
           <button type="button" className={`navitem${view === "settings" ? " active" : ""}`} data-tip={t("Settings")} title={t("Settings")} onClick={openAccountSettings}>
             <Icon name="settings" /><span className="navlabel">{t("Settings")}</span>
           </button>
-          <div className="sidecredit">
-            {/* Only the name is a link, and it points at its owner: "Developed by
-                Xreacher" goes to Xreacher, not to AliasMode. The project's own
-                links are the GitHub and Telegram marks beside it. */}
-            <span className="watermark">
-              {t("Developed by")}
-              <a href="https://xreacher.com/" target="_blank" rel="noreferrer" title="xreacher.com">Xreacher</a>
-            </span>
-            <div className="projectlinks">
-              {PROJECT_LINKS.map((link) => (
-                <a
-                  key={link.label}
-                  className="projectlink tip"
-                  href={link.href}
-                  target="_blank"
-                  rel="noreferrer"
-                  data-tip={link.label}
-                  aria-label={t("AliasMode on {name}", { name: link.label })}
-                >
-                  <svg className="brandmark" viewBox="0 0 24 24" aria-hidden="true"><path d={link.path} /></svg>
-                </a>
-              ))}
-            </div>
-            <p className="footer-mark" aria-hidden="true">AliasMode</p>
-          </div>
         </div>
         {modeErr && <div className="mode-error" role="alert">{modeErr}</div>}
       </aside>
@@ -4450,6 +4540,18 @@ function App() {
           )}
         </footer>
       </div>
+      ) : view === "sync" ? (
+      <div className="workspace">
+        <div className="settingspage">
+          <h2 className="sect-title">{t("WebDAV Sync")}</h2>
+          <WebDavSyncPanel
+            profileCount={profiles.length}
+            onSynced={load}
+            onConfigChanged={setWebdavConfig}
+          />
+          <LocalNetworkPanel onChanged={setLocalNetwork} />
+        </div>
+      </div>
       ) : view === "settings" ? (
       <div className="workspace">
         <div className="tabs" role="tablist" aria-label={t("Settings sections")}>
@@ -4462,226 +4564,48 @@ function App() {
               className={`tab${settingsTab === tab.key ? " active" : ""}`}
               onClick={() => setSettingsTab(tab.key)}
             >
-              {tab.key === "team" && isCloudMode ? t("Team") : t(tab.label)}
+              {t(tab.label)}
             </button>
           ))}
         </div>
         <div className="settingspage">
           {settingsTab === "account" && (
             <>
-              <h2 className="sect-title">{t("Account information")}</h2>
-              <div className="identity-card">
-                <span className="identity-avatar"><Icon name="user" className="lg" /></span>
-                <span className="identity-lines">
-                  <b>{isCloudMode ? cloudAuth?.user?.email ?? t("Cloud account") : t("Local workspace")}</b>
-                  <span>
-                    {isCloudMode
-                      ? `${t(cloudAuth?.workspace?.role ?? "member")} · ${cloudAuth?.workspace?.name ?? t("Cloud workspace")}`
-                      : t("No account · profile data stays on this computer")}
-                  </span>
-                </span>
-                <span className="chip">{isCloudMode ? t("Cloud") : t("Local")}</span>
-              </div>
-<section className="settings-card">
-            <header><Icon name="user" className="sm" /><h2>{t("Account")}</h2></header>
-            <div className="card-body">
-            <div className="settings-row"><span>{t("Signed in as")}</span><strong>{isCloudMode ? cloudAuth?.user?.email ?? t("Cloud account") : t("Local · no account")}</strong></div>
-            <div className="settings-row"><span>{t("Profiles stored")}</span><strong>{profiles.length}</strong></div>
-            {isCloudMode && cloudAuth?.authenticated && (
-              <button className="btn danger" type="button" disabled={authBusy} onClick={() => void signOut()}>
-                <Icon name="power" className="sm" />{authBusy ? t("Signing out…") : t("Sign out / Switch account")}
-              </button>
-            )}
-            {authErr && <p className="modal-err" role="alert">{authErr}</p>}
-            </div>
-          </section>
+              <h2 className="sect-title">{t("WebDAV Sync & Network")}</h2>
+              <WebDavSyncPanel
+                profileCount={profiles.length}
+                onSynced={load}
+                onConfigChanged={setWebdavConfig}
+              />
+              <LocalNetworkPanel onChanged={setLocalNetwork} />
 
-          <section className="settings-card support-settings">
-            <header><HeartIcon filled className="sm" /><h2>{t("Support AliasMode")}</h2>{supporter?.tier && <SupporterBadge tier={supporter.tier} />}</header>
-            <div className="card-body">
-              <p>{t("AliasMode is free and open source. Supporters pay for servers and engine builds.")}</p>
-              <button className="btn" type="button" onClick={() => setSupportSource("settings")}>
-                <HeartIcon className="sm" />{supporter?.tier ? t("Support again or edit your profile") : t("Support AliasMode")}
-              </button>
-            </div>
-          </section>
-
-          {isCloudMode && cloudAuth?.authenticated && (
-            <section className="settings-card remote-mcp-settings">
-              <header>
-                <Icon name="cloud" className="sm" /><h2>{t("Remote MCP")}</h2>
-                <span className={`remote-mcp-status ${remoteMcp.state}`}>
-                  {remoteMcp.state === "active" ? t("Ready") : remoteMcp.state === "disabled" ? t("Disabled") : remoteMcp.state === "loading" ? t("Preparing") : remoteMcp.state === "error" ? t("Unavailable") : t("Not ready")}
-                </span>
-              </header>
-              <div className="card-body">
-                <p>{t("Connect an AI client on another computer. Browser windows open on this Windows PC, so keep AliasMode running.")}</p>
-                {remoteMcp.state === "loading" && <p className="hint" role="status">{t("Preparing your secure connection…")}</p>}
-                {remoteMcp.state === "active" && remoteMcp.url && remoteMcp.token && (
-                  <>
-                    <label className="fld remote-mcp-field">
-                      <span>{t("MCP server URL")}</span>
-                      <span className="remote-mcp-value">
-                        <input className="mono" value={remoteMcp.url} readOnly />
-                        <button className="btn" type="button" disabled={authBusy} onClick={() => void copyRemoteMcp("url", remoteMcp.url!)}>{remoteMcpCopied === "url" ? t("Copied") : t("Copy")}</button>
-                      </span>
-                    </label>
-                    <label className="fld remote-mcp-field">
-                      <span>{t("Access key")}</span>
-                      <span className="remote-mcp-value">
-                        <input className="mono" value={remoteMcpTokenVisible ? remoteMcp.token : "••••••••••••••••••••••••"} readOnly aria-label={t("Remote MCP access key")} />
-                        <button className="btn" type="button" disabled={authBusy} onClick={() => setRemoteMcpTokenVisible((visible) => !visible)}>{remoteMcpTokenVisible ? t("Hide") : t("Reveal")}</button>
-                        <button className="btn" type="button" disabled={authBusy} onClick={() => void copyRemoteMcp("token", remoteMcp.token!)}>{remoteMcpCopied === "token" ? t("Copied") : t("Copy")}</button>
-                      </span>
-                    </label>
-                    <div className="hint remote-mcp-guide">
-                      <strong>{t("Connect Claude.ai or ChatGPT")}</strong>
-                      <ol>
-                        <li>{t("Add a custom MCP connector or app.")}</li>
-                        <li>{t("Paste the MCP server URL and select Connect.")}</li>
-                        <li>{t("Sign into AliasMode and select Allow.")}</li>
-                      </ol>
-                      <details>
-                        <summary>{t("Claude Code and other clients")}</summary>
-                        <p>{t("Claude Code uses an HTTP entry in {file}. Keep the access key in an environment variable. Other bearer-capable MCP clients can use the same URL and secret header.", { file: ".mcp.json" })}</p>
-                        <p>{t("Claude.ai and ChatGPT use OAuth and do not need the access key.")}</p>
-                      </details>
-                    </div>
-                    <div className="update-actions">
-                      <button className="btn" type="button" disabled={authBusy} onClick={() => void regenerateRemoteMcp()}>{t("Regenerate key")}</button>
-                      <button className="btn danger" type="button" disabled={authBusy} onClick={() => void disableRemoteMcp()}>{t("Disable")}</button>
-                    </div>
-                  </>
-                )}
-                {remoteMcp.state === "disabled" && (
-                  <>
-                    <p>{t("Remote connections are disabled for this Windows device.")}</p>
-                    <button className="btn" type="button" disabled={authBusy} onClick={() => void enableRemoteMcp()}>{t("Enable Remote MCP")}</button>
-                  </>
-                )}
-                {remoteMcp.error && <div className="modal-err" role="alert">{t(remoteMcp.error)}</div>}
-                {remoteMcp.state === "error" && <button className="btn" type="button" disabled={authBusy} onClick={() => void loadRemoteMcp()}>{t("Try again")}</button>}
-              </div>
-            </section>
-          )}
-
-<section className="settings-card">
-            <header><Icon name="sun" className="sm" /><h2>{t("Appearance")}</h2></header>
-            <div className="card-body">
-              <p>{t("Choose how AliasMode looks. System follows your operating system setting.")}</p>
-              <label className="fld"><span>{t("language.label")}</span>
-                <select className="select" value={language} onChange={(event) => setLanguage(event.target.value)}>
-                  {availableLanguages().map((lang) => (
-                    <option key={lang} value={lang}>{languageNativeName(lang)}</option>
-                  ))}
-                </select>
-              </label>
-              <div className="segmented" role="radiogroup" aria-label={t("Theme")}>
-                {THEMES.map((option) => (
-                  <button
-                    key={option.key}
-                    type="button"
-                    role="radio"
-                    aria-checked={theme === option.key}
-                    className={theme === option.key ? "active" : ""}
-                    onClick={() => chooseTheme(option.key)}
-                  >
-                    <Icon name={option.icon} className="sm" />{t(option.label)}
-                  </button>
-                ))}
-              </div>
-              {appMode && <label className="extchk">
-                <input type="checkbox" checked={!appMode.servicesHidden} onChange={(event) => void showServices(event.target.checked)} />
-                <span>{t("Show Services in the sidebar")}</span>
-              </label>}
-              {servicesSettingErr && <p className="modal-err" role="alert">{t(servicesSettingErr)}</p>}
-            </div>
-          </section>
-          <section className="settings-card">
-            <header><Icon name={isCloudMode ? "laptop" : "cloud"} className="sm" /><h2>{t("Switch mode")}</h2></header>
-            <div className="card-body settings-mode">
-              <p>{isCloudMode ? t("Local mode keeps this installation offline from AliasMode Cloud.") : t("Cloud mode requires an account and does not upload Local profiles automatically.")}</p>
-              <button className="btn" type="button" disabled={modeBusy || desktopUpdateInstalling} onClick={() => requestModeSwitch(isCloudMode ? "local" : "cloud")}>
-                <Icon name={isCloudMode ? "laptop" : "cloud"} className="sm" />
-                {t("Switch to {target}", { target: isCloudMode ? t("Local") : t("Cloud") })}
-              </button>
-            </div>
-          </section>
-          
-            </>
-          )}
-          {settingsTab === "team" && (
-            <>
-              <h2 className="sect-title">{isCloudMode ? t("Team and folder access") : t("Workspace")}</h2>
-<section className="settings-card">
-            <header><Icon name="folders" className="sm" /><h2>{isCloudMode ? t("Team") : t("Workspace")}</h2></header>
-            <div className="card-body">
-            {isCloudMode ? (
-              <>
-                <div className="settings-row"><span>{t("Workspace")}</span><strong>{cloudAuth?.workspace?.name ?? t("Cloud workspace")}</strong></div>
-                <div className="settings-row"><span>{t("Role")}</span><strong>{t(cloudAuth?.workspace?.role ?? "member")}</strong></div>
-                {teamBusy && !team && <p className="hint" role="status">{t("Loading team…")}</p>}
-                <h3 className="settings-subhead">{t("Members")}</h3>
-                {team?.members.map((member) => (
-                  <div className="team-member" key={member.accountId}>
-                    <div className="settings-row">
-                      <span>{member.email}<small> · {member.grants.map((grant) => `${grant.folderName}: ${grant.permission}`).join(", ") || t("No folder access")}</small></span>
-                      {member.role === "owner" || cloudAuth?.workspace?.role !== "owner" ? <strong>{t(member.role)}</strong> : (
-                        <select className="select" aria-label={t("Role for {email}", { email: member.email })} value={member.role} disabled={teamBusy} onChange={(event) => void runTeamAction("role", { accountId: member.accountId, role: event.target.value })}>
-                          <option value="member">{t("member")}</option><option value="admin">{t("admin")}</option>
-                        </select>
-                      )}
-                      {member.role !== "owner" && (cloudAuth?.workspace?.role === "owner" || (cloudAuth?.workspace?.role === "admin" && member.role === "member")) && (
-                        <button className="btn xs" type="button" aria-label={t("Send password reset to {email}", { email: member.email })} disabled={teamBusy} onClick={() => void runTeamAction("reset-password", { accountId: member.accountId }, t("Password reset email sent to {email}", { email: member.email }))}>{t("Reset password")}</button>
-                      )}
-                    </div>
-                    {member.role === "member" && (cloudAuth?.workspace?.role === "owner" || cloudAuth?.workspace?.role === "admin") && (
-                      <div className="team-grants">
-                        {team.folders.filter((folder) => !folder.archivedAt).map((folder) => {
-                          const permission = member.grants.find((grant) => grant.folderName === folder.name)?.permission ?? "";
-                          return <GrantControl key={folder.name} label={t("{folder} access for {email}", { folder: folder.name, email: member.email })} direct={permission} inherited={folderGrantPermission(team.folders, member.grants, folder.name, false)} busy={teamBusy} onChange={(permission) => void runTeamAction(permission ? "grant" : "remove-grant", { folderName: folder.name, accountId: member.accountId, permission })} />;
-                        })}
-                        <button className="btn xs danger" type="button" aria-label={t("Remove {email}", { email: member.email })} disabled={teamBusy} onClick={() => void runTeamAction("remove-member", { accountId: member.accountId }, t("Removed {email}", { email: member.email }))}>{t("Remove")}</button>
-                      </div>
-                    )}
+              <section className="settings-card">
+                <header><Icon name="sun" className="sm" /><h2>{t("Appearance")}</h2></header>
+                <div className="card-body">
+                  <p>{t("Choose how AliasMode looks. System follows your operating system setting.")}</p>
+                  <label className="fld"><span>{t("language.label")}</span>
+                    <select className="select" value={language} onChange={(event) => setLanguage(event.target.value)}>
+                      {availableLanguages().map((lang) => (
+                        <option key={lang} value={lang}>{languageNativeName(lang)}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="segmented" role="radiogroup" aria-label={t("Theme")}>
+                    {THEMES.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        role="radio"
+                        aria-checked={theme === option.key}
+                        className={theme === option.key ? "active" : ""}
+                        onClick={() => chooseTheme(option.key)}
+                      >
+                        <Icon name={option.icon} className="sm" />{t(option.label)}
+                      </button>
+                    ))}
                   </div>
-                ))}
-                {(cloudAuth?.workspace?.role === "owner" || cloudAuth?.workspace?.role === "admin") && (
-                  <>
-                    <h3 className="settings-subhead">{t("Invitations")}</h3>
-                    <form className="team-code" onSubmit={(event) => { event.preventDefault(); void inviteTeamMember(); }}>
-                      <input className="input" type="email" aria-label={t("Invite email")} aria-describedby="invite-team-help" placeholder={t("Staff email address")} value={teamEmail} disabled={teamBusy} onChange={(event) => setTeamEmail(event.target.value)} />
-                      {cloudAuth?.workspace?.role === "owner" && <select className="select" aria-label={t("Invitation role")} value={teamRole} disabled={teamBusy} onChange={(event) => setTeamRole(event.target.value as "admin" | "member")}><option value="member">{t("Member")}</option><option value="admin">{t("Admin")}</option></select>}
-                      <button className="btn primary" type="submit" disabled={teamBusy || !teamEmail.trim()}>{t("Send invite")}</button>
-                    </form>
-                    <p className="hint" id="invite-team-help">{t("Invitations go to that exact verified email. New members see no folders until you grant access here.")}</p>
-                    {team?.invitations.filter((invite) => !invite.acceptedAt && !invite.revokedAt).map((invite) => {
-                      const statusCode = invite.expiresAt <= Date.now() ? "expired" : "pending";
-                      const status = t(statusCode === "expired" ? "Expired" : "Pending");
-                      return <div className="settings-row" key={invite.id}>
-                        <span>{invite.email}<small>{invite.role}</small></span>
-                        <span>
-                          <span className={`team-tag ${statusCode}`}>{status}</span>
-                          {(cloudAuth?.workspace?.role === "owner" || invite.role === "member") && <> <button className="btn xs" type="button" aria-label={t("Resend invitation to {email}", { email: invite.email })} disabled={teamBusy} onClick={() => void runTeamAction("resend", { id: invite.id }, t("Invitation resent"))}>{t("Resend")}</button> <button className="btn xs danger" type="button" aria-label={t("Revoke invitation to {email}", { email: invite.email })} disabled={teamBusy} onClick={() => void runTeamAction("revoke", { id: invite.id }, t("Invitation revoked"))}>{t("Revoke")}</button></>}
-                        </span>
-                      </div>;
-                    })}
-                  </>
-                )}
-                {teamErr && <p className="modal-err" role="alert">{t(teamErr)}</p>}
-                <h3 className="settings-subhead">{t("Join another workspace")}</h3>
-                <form className="team-code" onSubmit={(event) => { event.preventDefault(); void acceptInvitation(); }}>
-                  <input className="input" aria-label={t("Invitation code")} placeholder={t("Paste invitation code")} value={invitationCode} onChange={(event) => setInvitationCode(event.target.value)} />
-                  <button className="btn primary" type="submit" disabled={authBusy || !invitationCode.trim()}>{t("Accept")}</button>
-                </form>
-                <p className="hint">{t("Paste the code from your invitation email. It works only for the email you signed in with.")}</p>
-                {authNotice && <p className="hint" role="status">{t(authNotice)}</p>}
-                {authErr && <p className="modal-err" role="alert">{t(authErr)}</p>}
-              </>
-            ) : <p>{t("Local mode has no Cloud workspace.")}</p>}
-            </div>
-          </section>
-          
+                </div>
+              </section>
             </>
           )}
           {settingsTab === "advanced" && (
@@ -5002,63 +4926,202 @@ function App() {
               )}
               <details className="fingerprint-settings" open={createProxyOpen} onToggle={(event) => setCreateProxyOpen(event.currentTarget.open)}>
                 <summary>
-                  <span>{t("Proxy")}</span>
-                  <span className="automatic-badge">{createHasProxy ? `${form.host}${form.port ? `:${form.port}` : ""}` : t("Optional")}</span>
+                  <span>{t("Network & Proxy")}</span>
+                  <span className="automatic-badge">
+                    {form.proxyMode === "direct"
+                      ? t("Direct (no proxy)")
+                      : form.proxyMode === "local-clash"
+                        ? `${t("Local Clash")} (${localNetwork.localClashUrl})`
+                        : createHasProxy
+                          ? (form.uri.trim() ? `${form.proxyType.toUpperCase()}` : `${form.host}${form.port ? `:${form.port}` : ""}`)
+                          : t("Proxy node")}
+                  </span>
                 </summary>
                 <div className="proxy-settings">
-                  <div className="proxy-paste-row">
-                    <label className="fld grow">
-                      <span>{t("Paste proxy to autofill")} <span className="muted">{t("(select type first · host:port:username:password)")}</span></span>
-                      <input
-                        type="password"
-                        autoComplete="off"
-                        value={proxyPaste}
-                        placeholder={t("Paste here — credentials stay hidden")}
-                        onChange={(e) => { setProxyPaste(e.target.value); setProxyPasteOk(null); }}
-                        onPaste={(e) => {
-                          const pasted = e.clipboardData.getData("text");
-                          if (pasted) { e.preventDefault(); applyProxyPaste(pasted); }
-                        }}
-                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); applyProxyPaste(proxyPaste); } }}
-                      />
-                    </label>
-                    <button type="button" className="btn accent" disabled={!proxyPaste.trim()} onClick={() => applyProxyPaste(proxyPaste)}>{t("Autofill")}</button>
+                  <div className="segmented" role="radiogroup" aria-label={t("Network mode")}>
+                    {([
+                      { key: "direct", label: "Direct (no proxy)" },
+                      { key: "local-clash", label: "Local Clash" },
+                      { key: "node", label: "Proxy node" },
+                    ] as const).map((opt) => (
+                      <button
+                        key={opt.key}
+                        type="button"
+                        role="radio"
+                        aria-checked={form.proxyMode === opt.key}
+                        className={form.proxyMode === opt.key ? "active" : ""}
+                        onClick={() => setF("proxyMode", opt.key)}
+                      >
+                        {t(opt.label)}
+                      </button>
+                    ))}
                   </div>
-                  {proxyPasteOk && <div className="proxy-paste-ok"><Icon name="check" className="sm" />{proxyPasteOk}</div>}
-                  <div className="fld-row">
-                    <label className="fld type">
-                      <span>{t("Proxy type")}</span>
-                      <select value={form.proxyType} onChange={(e) => setF("proxyType", e.target.value)}>
-                        <option value="http">http</option>
-                        <option value="https">https</option>
-                        <option value="socks5">socks5</option>
-                      </select>
-                    </label>
-                    <label className="fld grow">
-                      <span>{t("Host")}</span>
-                      <input value={form.host} placeholder={t("blank = no proxy")} onChange={(e) => setF("host", e.target.value)} />
-                    </label>
-                    <label className="fld port">
-                      <span>{t("Port")}</span>
-                      <input value={form.port} inputMode="numeric" placeholder="8080" onChange={(e) => setF("port", e.target.value)} />
-                    </label>
-                  </div>
-                  <div className="fld-row">
-                    <label className="fld grow"><span>{t("Proxy user")}</span><input value={form.user} onChange={(e) => setF("user", e.target.value)} /></label>
-                    <label className="fld grow"><span>{t("Proxy pass")}</span><input type="password" value={form.pass} onChange={(e) => setF("pass", e.target.value)} /></label>
-                  </div>
-                  <div className="proxy-check-actions">
-                    <button
-                      type="button"
-                      className="btn proxy-check-btn"
-                      disabled={createProxyCheck.checking || !createHasProxy}
-                      aria-busy={createProxyCheck.checking}
-                      onClick={checkCreateProxy}
-                    >
-                      <Icon name="activity" className="sm" />
-                      {createProxyCheck.checking ? t("Checking…") : t("Check proxy")}
-                    </button>
-                  </div>
+
+                  {form.proxyMode === "direct" && (
+                    <small>{t("Launches with --no-proxy-server to bypass Windows system proxy and use your direct broadband connection.")}</small>
+                  )}
+
+                  {form.proxyMode === "local-clash" && (
+                    <div className="fld">
+                      <small>{t("Routes traffic through your local Clash / Mihomo proxy at {url}. Even if Clash TUN has DIRECT rules for Chrome, 127.0.0.1 still enters Clash.", { url: localNetwork.localClashUrl })}</small>
+                    </div>
+                  )}
+
+                  {form.proxyMode === "node" && (
+                    <>
+                      {poolPickerNodes.length > 0 && (
+                        <label className="fld">
+                          <span>{t("Pick from node pool")}</span>
+                          <select value="" onChange={(e) => {
+                            const node = poolPickerNodes.find((n) => n.id === e.target.value);
+                            if (node) applyProxyPaste(node.value);
+                          }}>
+                            <option value="">{t("Select a saved node…")}</option>
+                            {sortedPickerNodes.map((n) => (
+                              <option key={n.id} value={n.id}>{formatPoolPickerOption(n, t)}</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <div className="proxy-paste-row">
+                        <label className="fld grow">
+                          <span>{t("Paste proxy to autofill")} <span className="muted">{t("(select type first · host:port:username:password)")}</span></span>
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={proxyPaste}
+                            placeholder={t("Paste here — credentials stay hidden")}
+                            onChange={(e) => { setProxyPaste(e.target.value); setProxyPasteOk(null); }}
+                            onPaste={(e) => {
+                              const pasted = e.clipboardData.getData("text");
+                              if (pasted) { e.preventDefault(); applyProxyPaste(pasted); }
+                            }}
+                            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); applyProxyPaste(proxyPaste); } }}
+                          />
+                        </label>
+                        <button type="button" className="btn accent" disabled={!proxyPaste.trim()} onClick={() => applyProxyPaste(proxyPaste)}>{t("Autofill")}</button>
+                      </div>
+                      {proxyPasteOk && <div className="proxy-paste-ok"><Icon name="check" className="sm" />{proxyPasteOk}</div>}
+                      <div className="fld-row">
+                        <label className="fld type">
+                          <span>{t("Proxy type")}</span>
+                          <select value={form.proxyType} onChange={(e) => setF("proxyType", e.target.value)}>
+                            <option value="http">http</option>
+                            <option value="https">https</option>
+                            <option value="socks5">socks5</option>
+                            <option value="vless">vless</option>
+                            <option value="vmess">vmess</option>
+                            <option value="trojan">trojan</option>
+                            <option value="ss">ss</option>
+                            <option value="hysteria2">hysteria2</option>
+                            <option value="tuic">tuic</option>
+                            <option value="wireguard">wireguard</option>
+                          </select>
+                        </label>
+                        {isSingBoxType(form.proxyType) ? (
+                          <label className="fld grow">
+                            <span>{t("Share URI")}</span>
+                            <input value={form.uri} placeholder={t("Paste vless://, vmess://, trojan://, ss://, hy2://, tuic://, or wg://")} onChange={(e) => setF("uri", e.target.value)} />
+                          </label>
+                        ) : (
+                          <>
+                            <label className="fld grow">
+                              <span>{t("Host")}</span>
+                              <input value={form.host} placeholder={t("blank = no proxy")} onChange={(e) => setF("host", e.target.value)} />
+                            </label>
+                            <label className="fld port">
+                              <span>{t("Port")}</span>
+                              <input value={form.port} inputMode="numeric" placeholder="8080" onChange={(e) => setF("port", e.target.value)} />
+                            </label>
+                          </>
+                        )}
+                      </div>
+                      {!isSingBoxType(form.proxyType) && (
+                        <div className="fld-row">
+                          <label className="fld grow"><span>{t("Proxy user")}</span><input value={form.user} onChange={(e) => setF("user", e.target.value)} /></label>
+                          <label className="fld grow"><span>{t("Proxy pass")}</span><input type="password" value={form.pass} onChange={(e) => setF("pass", e.target.value)} /></label>
+                        </div>
+                      )}
+                      <details className="fingerprint-settings" open={form.preProxyMode !== "none"}>
+                        <summary>
+                          <span>{t("Pre-proxy (chain routing)")}</span>
+                          <span className="automatic-badge">
+                            {form.preProxyMode === "local-clash"
+                              ? t("Local Clash")
+                              : form.preProxyMode === "node" && form.preProxy.trim()
+                                ? t("Chain active")
+                                : t("Optional")}
+                          </span>
+                        </summary>
+                        <div className="proxy-settings">
+                          <small>{t("Route this proxy through an upstream transit node (Local → Pre-proxy → Proxy → Target).")}</small>
+                          <div className="segmented" role="radiogroup" aria-label={t("Pre-proxy mode")}>
+                            {([
+                              { key: "none", label: "Direct to node" },
+                              { key: "local-clash", label: "Local Clash" },
+                              { key: "node", label: "Transit node" },
+                            ] as const).map((opt) => (
+                              <button
+                                key={opt.key}
+                                type="button"
+                                role="radio"
+                                aria-checked={form.preProxyMode === opt.key}
+                                className={form.preProxyMode === opt.key ? "active" : ""}
+                                onClick={() => setF("preProxyMode", opt.key)}
+                              >
+                                {t(opt.label)}
+                              </button>
+                            ))}
+                          </div>
+                          {form.preProxyMode === "local-clash" && (
+                            <small>{t("Chains this landing node over your local Clash ({url}) so unreachable residential proxies connect cleanly.", { url: localNetwork.localClashUrl })}</small>
+                          )}
+                          {form.preProxyMode === "node" && (
+                            <>
+                              {poolPickerNodes.length > 0 && (
+                                <label className="fld">
+                                  <span>{t("Pick from node pool")}</span>
+                                  <select value="" onChange={(e) => {
+                                    const node = poolPickerNodes.find((n) => n.id === e.target.value);
+                                    if (node) { setF("preProxyType", node.type); setF("preProxy", node.value); }
+                                  }}>
+                                    <option value="">{t("Select a saved node…")}</option>
+                                    {sortedPickerNodes.map((n) => (
+                                      <option key={n.id} value={n.id}>{formatPoolPickerOption(n, t)}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                              )}
+                              <div className="fld-row">
+                                <label className="fld grow">
+                                  <span>{t("Pre-proxy address or URI")}</span>
+                                  <input value={form.preProxy} placeholder={t("Optional · paste vless://, trojan://, hy2://, socks5:// or host:port:user:pass")} onChange={(e) => setF("preProxy", e.target.value)} />
+                                </label>
+                                {form.preProxy.trim() && (
+                                  <button type="button" className="btn ghost" onClick={() => { setF("preProxy", ""); setF("preProxyMode", "none"); }}>{t("Clear pre-proxy")}</button>
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </details>
+                    </>
+                  )}
+
+                  {form.proxyMode !== "direct" && (
+                    <div className="proxy-check-actions">
+                      <button
+                        type="button"
+                        className="btn proxy-check-btn"
+                        disabled={createProxyCheck.checking || !createHasProxy}
+                        aria-busy={createProxyCheck.checking}
+                        onClick={checkCreateProxy}
+                      >
+                        <Icon name="activity" className="sm" />
+                        {createProxyCheck.checking ? t("Checking…") : t("Check proxy")}
+                      </button>
+                    </div>
+                  )}
                 </div>
               </details>
               <ProxyCheckFeedback hasProxy={createHasProxy} state={createProxyCheck} />
@@ -5163,33 +5226,150 @@ function App() {
                     <span>{t("Tags")} <span className="muted">{t("(comma-separated)")}</span></span>
                     <input value={editForm.tags ?? ""} placeholder="warmup, us, priority" onChange={(e) => setEF("tags", e.target.value)} />
                   </label>
-                  <div className="fld-row">
-                    <label className="fld type">
-                      <span>{t("Proxy type")}</span>
-                      <select value={editForm.proxyType ?? "http"} onChange={(e) => setEF("proxyType", e.target.value)}>
-                        <option value="http">http</option>
-                        <option value="https">https</option>
-                        <option value="socks5">socks5</option>
-                      </select>
-                    </label>
-                    <label className="fld grow">
-                      <span>Proxy</span>
-                      <input value={editForm.proxy ?? ""} placeholder="host:port:username:password" onChange={(e) => setEF("proxy", e.target.value)} />
-                      <small>{t("Leave blank to launch on a direct connection.")}</small>
-                    </label>
+                  <div className="fld">
+                    <span>{t("Network & Proxy")}</span>
+                    <div className="segmented" role="radiogroup" aria-label={t("Network mode")}>
+                      {([
+                        { key: "direct", label: "Direct (no proxy)" },
+                        { key: "local-clash", label: "Local Clash" },
+                        { key: "node", label: "Proxy node" },
+                      ] as const).map((opt) => (
+                        <button
+                          key={opt.key}
+                          type="button"
+                          role="radio"
+                          aria-checked={(editForm.proxyMode ?? "direct") === opt.key}
+                          className={(editForm.proxyMode ?? "direct") === opt.key ? "active" : ""}
+                          onClick={() => setEF("proxyMode", opt.key)}
+                        >
+                          {t(opt.label)}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  <div className="proxy-check-actions">
-                    <button
-                      type="button"
-                      className="btn proxy-check-btn"
-                      disabled={editProxyCheck.checking || timezoneBusy || !editHasProxy}
-                      aria-busy={editProxyCheck.checking}
-                      onClick={checkEditedProxy}
-                    >
-                      <Icon name="activity" className="sm" />
-                      {editProxyCheck.checking ? "Checking…" : t("Check proxy")}
-                    </button>
-                  </div>
+                  {(editForm.proxyMode ?? "direct") === "direct" && (
+                    <small>{t("Launches with --no-proxy-server to bypass Windows system proxy and use your direct broadband connection.")}</small>
+                  )}
+                  {(editForm.proxyMode ?? "direct") === "local-clash" && (
+                    <small>{t("Routes traffic through your local Clash / Mihomo proxy at {url}. Even if Clash TUN has DIRECT rules for Chrome, 127.0.0.1 still enters Clash.", { url: localNetwork.localClashUrl })}</small>
+                  )}
+                  {(editForm.proxyMode ?? "direct") === "node" && (
+                    <>
+                      {poolPickerNodes.length > 0 && (
+                        <label className="fld">
+                          <span>{t("Pick from node pool")}</span>
+                          <select value="" onChange={(e) => {
+                            const node = poolPickerNodes.find((n) => n.id === e.target.value);
+                            if (node) { setEF("proxyType", node.type); setEF("proxy", node.value); }
+                          }}>
+                            <option value="">{t("Select a saved node…")}</option>
+                            {sortedPickerNodes.map((n) => (
+                              <option key={n.id} value={n.id}>{formatPoolPickerOption(n, t)}</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <div className="fld-row">
+                        <label className="fld type">
+                          <span>{t("Proxy type")}</span>
+                          <select value={editForm.proxyType ?? "http"} onChange={(e) => setEF("proxyType", e.target.value)}>
+                            <option value="http">http</option>
+                            <option value="https">https</option>
+                            <option value="socks5">socks5</option>
+                            <option value="vless">vless</option>
+                            <option value="vmess">vmess</option>
+                            <option value="trojan">trojan</option>
+                            <option value="ss">ss</option>
+                            <option value="hysteria2">hysteria2</option>
+                            <option value="tuic">tuic</option>
+                            <option value="wireguard">wireguard</option>
+                          </select>
+                        </label>
+                        <label className="fld grow">
+                          <span>Proxy</span>
+                          <input value={editForm.proxy ?? ""} placeholder="host:port:username:password or vless://..." onChange={(e) => setEF("proxy", e.target.value)} />
+                          <small>{t("Independent proxy routed via sing-box.exe (bypasses Clash TUN when DIRECT rule is set).")}</small>
+                        </label>
+                      </div>
+                      <details className="fingerprint-settings" open={(editForm.preProxyMode ?? "none") !== "none"}>
+                        <summary>
+                          <span>{t("Pre-proxy (chain routing)")}</span>
+                          <span className="automatic-badge">
+                            {editForm.preProxyMode === "local-clash"
+                              ? t("Local Clash")
+                              : editForm.preProxyMode === "node" && (editForm.preProxy ?? "").trim()
+                                ? t("Chain active")
+                                : t("Optional")}
+                          </span>
+                        </summary>
+                        <div className="proxy-settings">
+                          <small>{t("Route this proxy through an upstream transit node (Local → Pre-proxy → Proxy → Target).")}</small>
+                          <div className="segmented" role="radiogroup" aria-label={t("Pre-proxy mode")}>
+                            {([
+                              { key: "none", label: "Direct to node" },
+                              { key: "local-clash", label: "Local Clash" },
+                              { key: "node", label: "Transit node" },
+                            ] as const).map((opt) => (
+                              <button
+                                key={opt.key}
+                                type="button"
+                                role="radio"
+                                aria-checked={(editForm.preProxyMode ?? "none") === opt.key}
+                                className={(editForm.preProxyMode ?? "none") === opt.key ? "active" : ""}
+                                onClick={() => setEF("preProxyMode", opt.key)}
+                              >
+                                {t(opt.label)}
+                              </button>
+                            ))}
+                          </div>
+                          {editForm.preProxyMode === "local-clash" && (
+                            <small>{t("Chains this landing node over your local Clash ({url}) so unreachable residential proxies connect cleanly.", { url: localNetwork.localClashUrl })}</small>
+                          )}
+                          {editForm.preProxyMode === "node" && (
+                            <>
+                              {poolPickerNodes.length > 0 && (
+                                <label className="fld">
+                                  <span>{t("Pick from node pool")}</span>
+                                  <select value="" onChange={(e) => {
+                                    const node = poolPickerNodes.find((n) => n.id === e.target.value);
+                                    if (node) { setEF("preProxyType", node.type); setEF("preProxy", node.value); }
+                                  }}>
+                                    <option value="">{t("Select a saved node…")}</option>
+                                    {sortedPickerNodes.map((n) => (
+                                      <option key={n.id} value={n.id}>{formatPoolPickerOption(n, t)}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                              )}
+                              <div className="fld-row">
+                                <label className="fld grow">
+                                  <span>{t("Pre-proxy address or URI")}</span>
+                                  <input value={editForm.preProxy ?? ""} placeholder={t("Optional · paste vless://, trojan://, hy2://, socks5:// or host:port:user:pass")} onChange={(e) => setEF("preProxy", e.target.value)} />
+                                </label>
+                                {(editForm.preProxy ?? "").trim() && (
+                                  <button type="button" className="btn ghost" onClick={() => { setEF("preProxy", ""); setEF("preProxyMode", "none"); }}>{t("Clear pre-proxy")}</button>
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </details>
+                    </>
+                  )}
+                  {(editForm.proxyMode ?? "direct") !== "direct" && (
+                    <div className="proxy-check-actions">
+                      <button
+                        type="button"
+                        className="btn proxy-check-btn"
+                        disabled={editProxyCheck.checking || timezoneBusy || !editHasProxy}
+                        aria-busy={editProxyCheck.checking}
+                        onClick={checkEditedProxy}
+                      >
+                        <Icon name="activity" className="sm" />
+                        {editProxyCheck.checking ? "Checking…" : t("Check proxy")}
+                      </button>
+                    </div>
+                  )}
                   <ProxyCheckFeedback hasProxy={editHasProxy} state={editProxyCheck} />
                   {!isCloudMode && !appMode?.legacyRemote && (
                     <>

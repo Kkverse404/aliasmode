@@ -1,7 +1,23 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "./i18n.tsx";
 import { folderScope, type FolderInfo } from "../folders.ts";
 import { ProxyProviderOffer } from "./proxy-offer.tsx";
+import {
+  addProxySubscription,
+  assignProxyPoolNodes,
+  deleteProxyPoolNodes,
+  deleteProxySubscription,
+  fetchProxyPool,
+  importProxyPoolNodes,
+  installSingBoxKernel,
+  refreshProxySubscription,
+  streamCheckProxyPoolNodes,
+  type IpNetworkType,
+  type IpRiskLevel,
+  type ProxyPoolNodeView,
+  type ProxySubscriptionView,
+  type SingBoxKernelStatusView,
+} from "./api.ts";
 import type {
   ProxyCheckView,
   ProxyPreview,
@@ -42,6 +58,156 @@ function getReasonLabel(t: (key: string) => string, reason: string): string {
     cancelled: t("Not completed"), folder_access_denied: t("Folder access denied"),
   };
   return reasons[reason] || t("Check could not complete");
+}
+
+export type SortDir = "asc" | "desc";
+export type PoolSortKey = "default" | "latency" | "risk" | "status" | "country" | "protocol" | "name";
+export type PoolRiskFilter = "all" | "working" | "low" | "medium_or_low" | "high" | "unchecked";
+export type CheckSortKey = "default" | "latency" | "risk" | "status" | "ip";
+
+function getRiskLevelLabel(t: (key: string) => string, level: IpRiskLevel | ""): string {
+  if (level === "low") return t("Low risk");
+  if (level === "medium") return t("Medium risk");
+  if (level === "high") return t("High risk");
+  return "";
+}
+
+function getIpTypeLabel(t: (key: string) => string, type: IpNetworkType | "" | undefined): string {
+  if (type === "residential") return t("Residential");
+  if (type === "mobile") return t("Mobile");
+  if (type === "datacenter") return t("Datacenter");
+  if (type === "vpn") return t("VPN");
+  if (type === "proxy") return t("Proxy IP");
+  if (type === "tor") return t("Tor");
+  if (type === "unknown") return t("Unknown");
+  return "";
+}
+
+function latencyTierClass(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms)) return "";
+  if (ms < 150) return "fast";
+  if (ms <= 350) return "mid";
+  return "slow";
+}
+
+function statusRank(status: string): number {
+  if (status === "working") return 0;
+  if (status === "unstable") return 1;
+  if (status === "failed") return 2;
+  if (status === "unavailable") return 3;
+  if (status === "missing" || status === "invalid" || status === "unsupported") return 4;
+  return 5;
+}
+
+function compareNullableNumber(a: number | null | undefined, b: number | null | undefined, dir: SortDir): number {
+  const aValid = typeof a === "number" && Number.isFinite(a);
+  const bValid = typeof b === "number" && Number.isFinite(b);
+  if (!aValid && !bValid) return 0;
+  if (!aValid) return 1;
+  if (!bValid) return -1;
+  return dir === "asc" ? a! - b! : b! - a!;
+}
+
+function compareNullableString(a: string | undefined, b: string | undefined, dir: SortDir): number {
+  const aVal = (a ?? "").trim();
+  const bVal = (b ?? "").trim();
+  if (!aVal && !bVal) return 0;
+  if (!aVal) return 1;
+  if (!bVal) return -1;
+  const cmp = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: "base" });
+  return dir === "asc" ? cmp : -cmp;
+}
+
+export function sortPoolNodes(nodes: ProxyPoolNodeView[], sortKey: PoolSortKey, sortDir: SortDir): ProxyPoolNodeView[] {
+  if (sortKey === "default") return nodes;
+  return [...nodes].sort((a, b) => {
+    let diff = 0;
+    if (sortKey === "latency") {
+      diff = compareNullableNumber(a.lastLatencyMs, b.lastLatencyMs, sortDir)
+        || compareNullableNumber(a.lastRiskScore, b.lastRiskScore, "asc");
+    } else if (sortKey === "risk") {
+      diff = compareNullableNumber(a.lastRiskScore, b.lastRiskScore, sortDir)
+        || compareNullableNumber(a.lastLatencyMs, b.lastLatencyMs, "asc");
+    } else if (sortKey === "status") {
+      const aUnchecked = !a.lastStatus;
+      const bUnchecked = !b.lastStatus;
+      if (aUnchecked !== bUnchecked) diff = aUnchecked ? 1 : -1;
+      else diff = (statusRank(a.lastStatus) - statusRank(b.lastStatus)) * (sortDir === "asc" ? 1 : -1);
+      if (!diff) diff = compareNullableNumber(a.lastLatencyMs, b.lastLatencyMs, "asc");
+    } else if (sortKey === "country") {
+      diff = compareNullableString(a.lastCountry || a.lastIp, b.lastCountry || b.lastIp, sortDir)
+        || compareNullableNumber(a.lastRiskScore, b.lastRiskScore, "asc");
+    } else if (sortKey === "protocol") {
+      diff = compareNullableString(a.type, b.type, sortDir);
+    } else if (sortKey === "name") {
+      diff = compareNullableString(a.name, b.name, sortDir);
+    }
+    return diff || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  });
+}
+
+export function sortCheckRows(rows: ProxyCheckView[], sortKey: CheckSortKey, sortDir: SortDir): ProxyCheckView[] {
+  if (sortKey === "default") return rows;
+  return [...rows].sort((a, b) => {
+    let diff = 0;
+    if (sortKey === "latency") {
+      diff = compareNullableNumber(a.latencyMs, b.latencyMs, sortDir)
+        || compareNullableNumber(a.riskScore, b.riskScore, "asc");
+    } else if (sortKey === "risk") {
+      diff = compareNullableNumber(a.riskScore, b.riskScore, sortDir)
+        || compareNullableNumber(a.latencyMs, b.latencyMs, "asc");
+    } else if (sortKey === "status") {
+      diff = (statusRank(a.status) - statusRank(b.status)) * (sortDir === "asc" ? 1 : -1)
+        || compareNullableNumber(a.latencyMs, b.latencyMs, "asc");
+    } else if (sortKey === "ip") {
+      diff = compareNullableString(a.country || a.ip, b.country || b.ip, sortDir)
+        || compareNullableNumber(a.riskScore, b.riskScore, "asc");
+    }
+    return diff || (a.proxy ?? "").localeCompare(b.proxy ?? "");
+  });
+}
+
+export function sortNodesForPicker(nodes: ProxyPoolNodeView[]): ProxyPoolNodeView[] {
+  const tier = (status: ProxyPoolNodeView["lastStatus"]): number => {
+    if (status === "working") return 0;
+    if (status === "unstable") return 1;
+    if (status === "") return 2;
+    if (status === "unavailable") return 3;
+    return 4;
+  };
+  return [...nodes].sort((a, b) => (
+    tier(a.lastStatus) - tier(b.lastStatus)
+    || compareNullableNumber(a.lastRiskScore, b.lastRiskScore, "asc")
+    || compareNullableNumber(a.lastLatencyMs, b.lastLatencyMs, "asc")
+    || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })
+  ));
+}
+
+export function formatPoolPickerOption(node: ProxyPoolNodeView, t: (key: string) => string): string {
+  const prefix = `[${node.type.toUpperCase()}] ${node.name}`;
+  if (node.lastStatus === "failed") {
+    return `${prefix} · ${t("Dead")}`;
+  }
+  const parts: string[] = [];
+  if (node.lastCountry) parts.push(node.lastCountry);
+  if (node.lastLatencyMs != null) parts.push(`${node.lastLatencyMs}ms`);
+  if (node.lastRiskScore != null && node.lastRiskLevel) {
+    parts.push(`${getRiskLevelLabel(t, node.lastRiskLevel)} ${node.lastRiskScore}`);
+  }
+  if (!parts.length) return `${prefix} (${node.host}:${node.port})`;
+  return `${prefix} · ${parts.join(" · ")}`;
+}
+
+function formatBytes(bytes?: number): string {
+  if (!bytes || !Number.isFinite(bytes)) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let val = bytes;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx++;
+  }
+  return `${val.toFixed(val >= 100 ? 0 : 1)} ${units[idx]}`;
 }
 
 export function proxyScope(all: boolean, groups: string[], ids?: string[]): ProxyScope {
@@ -195,7 +361,7 @@ export function ProxiesPage({ groups, folders = [], onChanged, active, profilesW
   const { t } = useTranslation();
   const [all, setAll] = useState(true);
   const [selectedGroups, setSelectedGroups] = useState<string[]>([]);
-  const [task, setTask] = useState<"check" | "replace">("check");
+  const [task, setTask] = useState<"check" | "replace" | "pool">("check");
   const [mode, setMode] = useState<ProxyReplacementMode>("list");
   const [input, setInput] = useState("");
   const [perProxy, setPerProxy] = useState(1);
@@ -210,17 +376,112 @@ export function ProxiesPage({ groups, folders = [], onChanged, active, profilesW
   const [checkPage, setCheckPage] = useState(0);
   const [replacementFailures, setReplacementFailures] = useState(false);
   const [checkFailures, setCheckFailures] = useState(false);
+  const [checkSortKey, setCheckSortKey] = useState<CheckSortKey>("default");
+  const [checkSortDir, setCheckSortDir] = useState<SortDir>("asc");
+
+  // ---- Node pool & subscriptions state (sing-box + chain proxy) ----
+  const [kernel, setKernel] = useState<SingBoxKernelStatusView | null>(null);
+  const [subscriptions, setSubscriptions] = useState<ProxySubscriptionView[]>([]);
+  const [poolNodes, setPoolNodes] = useState<ProxyPoolNodeView[]>([]);
+  const [poolBusy, setPoolBusy] = useState<"load" | "kernel" | "sub" | "import" | "check" | "assign" | "delete" | null>(null);
+  const [subName, setSubName] = useState("");
+  const [subUrl, setSubUrl] = useState("");
+  const [subUseLocalClash, setSubUseLocalClash] = useState(false);
+  const [nodePaste, setNodePaste] = useState("");
+  const [poolQuery, setPoolQuery] = useState("");
+  const [poolSource, setPoolSource] = useState<string>("all");
+  const [poolRiskFilter, setPoolRiskFilter] = useState<PoolRiskFilter>("all");
+  const [poolSortKey, setPoolSortKey] = useState<PoolSortKey>("default");
+  const [poolSortDir, setPoolSortDir] = useState<SortDir>("asc");
+  const [poolIncludeRisk, setPoolIncludeRisk] = useState(true);
+  const [poolCheckProgress, setPoolCheckProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [copiedNodeId, setCopiedNodeId] = useState<string | null>(null);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [poolPreProxyId, setPoolPreProxyId] = useState("");
+  const [poolPerNode, setPoolPerNode] = useState(1);
+  const [poolPage, setPoolPage] = useState(0);
+
   const controller = useRef<AbortController | null>(null);
+  const poolController = useRef<AbortController | null>(null);
   const scope = proxyScope(all, selectedGroups);
   const scopeReady = all || selectedGroups.length > 0;
   const folderNames = [...new Set(groups)];
   const retries = retryProxyProfileIds(preview?.rows ?? []);
   const failedChecks = failedProxyProfileIds(checks);
   const replacements = proxyResultPage((preview?.rows ?? []).filter((row) => !replacementFailures || ["failed", "skipped", "missing"].includes(row.status)), replacementPage);
-  const checkResults = proxyResultPage(checks.filter((row) => !checkFailures || row.status !== "working"), checkPage);
+  const sortedChecks = useMemo(
+    () => sortCheckRows(checks.filter((row) => !checkFailures || row.status !== "working"), checkSortKey, checkSortDir),
+    [checks, checkFailures, checkSortKey, checkSortDir],
+  );
+  const checkResults = proxyResultPage(sortedChecks, checkPage);
   const ready = preview?.rows.filter((row) => row.status === "ready").length ?? 0;
 
-  useEffect(() => () => { controller.current?.abort(); controller.current = null; }, []);
+  const filteredPoolNodes = useMemo(() => {
+    const q = poolQuery.trim().toLowerCase();
+    const filtered = poolNodes.filter((node) => {
+      if (poolSource === "manual" && node.subscriptionId !== "") return false;
+      if (poolSource !== "all" && poolSource !== "manual" && node.subscriptionId !== poolSource) return false;
+      if (poolRiskFilter === "working" && node.lastStatus !== "working") return false;
+      if (poolRiskFilter === "low" && node.lastRiskLevel !== "low") return false;
+      if (poolRiskFilter === "medium_or_low" && node.lastRiskLevel !== "low" && node.lastRiskLevel !== "medium") return false;
+      if (poolRiskFilter === "high" && node.lastRiskLevel !== "high") return false;
+      if (poolRiskFilter === "unchecked" && node.lastStatus !== "") return false;
+      if (!q) return true;
+      return (
+        node.name.toLowerCase().includes(q)
+        || node.type.toLowerCase().includes(q)
+        || node.host.toLowerCase().includes(q)
+        || node.lastCountry.toLowerCase().includes(q)
+        || (node.lastCity ?? "").toLowerCase().includes(q)
+        || (node.lastIsp ?? "").toLowerCase().includes(q)
+        || (node.lastIpType ?? "").toLowerCase().includes(q)
+        || node.lastIp.toLowerCase().includes(q)
+      );
+    });
+    return sortPoolNodes(filtered, poolSortKey, poolSortDir);
+  }, [poolNodes, poolQuery, poolSource, poolRiskFilter, poolSortKey, poolSortDir]);
+  const pagedPoolNodes = proxyResultPage(filteredPoolNodes, poolPage);
+
+  const togglePoolSort = (key: Exclude<PoolSortKey, "default">) => {
+    if (poolSortKey === key) setPoolSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+    else { setPoolSortKey(key); setPoolSortDir("asc"); }
+    setPoolPage(0);
+  };
+
+  const toggleCheckSort = (key: Exclude<CheckSortKey, "default">) => {
+    if (checkSortKey === key) setCheckSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+    else { setCheckSortKey(key); setCheckSortDir("asc"); }
+    setCheckPage(0);
+  };
+
+  const sortIndicator = (activeKey: string, targetKey: string, dir: SortDir) =>
+    activeKey === targetKey ? (dir === "asc" ? " ↑" : " ↓") : "";
+
+  useEffect(() => () => {
+    controller.current?.abort(); controller.current = null;
+    poolController.current?.abort(); poolController.current = null;
+  }, []);
+
+  const loadPool = async () => {
+    setPoolBusy("load");
+    try {
+      const state = await fetchProxyPool();
+      setKernel(state.kernel);
+      setSubscriptions(state.subscriptions);
+      setPoolNodes(state.nodes);
+      const validIds = new Set(state.nodes.map((n) => n.id));
+      setSelectedNodeIds((prev) => prev.filter((id) => validIds.has(id)));
+      if (poolPreProxyId && poolPreProxyId !== "__local_clash__" && !validIds.has(poolPreProxyId)) setPoolPreProxyId("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPoolBusy(null);
+    }
+  };
+
+  useEffect(() => {
+    if (active && task === "pool") void loadPool();
+  }, [active, task]);
 
   const invalidatePreview = () => {
     setPreview(null); setReplacementPage(0); setError(null); setNotice(null);
@@ -314,12 +575,236 @@ export function ProxiesPage({ groups, folders = [], onChanged, active, profilesW
     finally { finish(current); }
   };
 
+  // ---- Node pool actions ----
+  const handleInstallKernel = async () => {
+    setPoolBusy("kernel"); setError(null); setNotice(null);
+    try {
+      const status = await installSingBoxKernel();
+      setKernel(status);
+      setNotice(`sing-box v${status.version} ${t("Installed")}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPoolBusy(null);
+    }
+  };
+
+  const handleAddSub = async () => {
+    if (!subUrl.trim()) return;
+    setPoolBusy("sub"); setError(null); setNotice(null);
+    try {
+      const res = await addProxySubscription({
+        name: subName.trim() || undefined,
+        url: subUrl.trim(),
+        useLocalClash: subUseLocalClash,
+      });
+      setSubName(""); setSubUrl("");
+      setNotice(t("Synced {count} nodes from subscription.", { count: res.imported }));
+      await loadPool();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPoolBusy(null);
+    }
+  };
+
+  const handleRefreshSub = async (id: string) => {
+    setPoolBusy("sub"); setError(null); setNotice(null);
+    try {
+      const res = await refreshProxySubscription(id, subUseLocalClash);
+      setNotice(res.preserved
+        ? t("Synced {count} nodes from subscription ({preserved} check results preserved).", {
+            count: res.imported,
+            preserved: res.preserved,
+          })
+        : t("Synced {count} nodes from subscription.", { count: res.imported }));
+      await loadPool();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      await loadPool();
+    }
+  };
+
+  const handleDeleteSub = async (id: string) => {
+    setPoolBusy("delete"); setError(null); setNotice(null);
+    try {
+      await deleteProxySubscription(id);
+      await loadPool();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPoolBusy(null);
+    }
+  };
+
+  const handleImportNodes = async () => {
+    if (!nodePaste.trim()) return;
+    setPoolBusy("import"); setError(null); setNotice(null);
+    try {
+      const res = await importProxyPoolNodes(nodePaste);
+      setNodePaste("");
+      setNotice(t("Imported {imported} nodes ({duplicates} duplicates, {skipped} skipped).", {
+        imported: res.imported, duplicates: res.duplicates, skipped: res.skipped,
+      }));
+      await loadPool();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPoolBusy(null);
+    }
+  };
+
+  const handleCheckPoolNodes = async (targetIds: string[]) => {
+    if (!targetIds.length || poolController.current) return;
+    const current = new AbortController();
+    poolController.current = current;
+    setPoolBusy("check");
+    setPoolCheckProgress({ completed: 0, total: targetIds.length });
+    setError(null);
+    setNotice(null);
+    let aliveCount = 0;
+    let finishedCount = 0;
+    let wasCancelled = false;
+    try {
+      await streamCheckProxyPoolNodes(
+        {
+          ids: targetIds,
+          preProxyNodeId: poolPreProxyId || undefined,
+          includeRisk: poolIncludeRisk,
+        },
+        (event) => {
+          if (poolController.current !== current) return;
+          if (event.type === "progress") {
+            setPoolCheckProgress({ completed: event.completed, total: event.total });
+          } else if (event.type === "result") {
+            const item = event.item;
+            finishedCount++;
+            if (item.status === "working") aliveCount++;
+            setPoolNodes((prev) => prev.map((node) => (
+              node.id === item.id
+                ? {
+                    ...node,
+                    lastStatus: item.status,
+                    lastReason: item.reason,
+                    lastIp: item.ip,
+                    lastCountry: item.country,
+                    lastCity: item.city,
+                    lastIsp: item.isp,
+                    lastIpType: item.ipType,
+                    lastRiskScore: item.riskScore,
+                    lastRiskLevel: item.riskLevel,
+                    lastRiskFlags: item.riskFlags,
+                    lastLatencyMs: item.latencyMs,
+                    lastCheckedAt: item.checkedAt,
+                  }
+                : node
+            )));
+          } else if (event.type === "done") {
+            wasCancelled = event.cancelled;
+          }
+        },
+        current.signal,
+      );
+      if (poolController.current === current) {
+        setNotice(wasCancelled
+          ? t("Cancelled node check. {completed} completed results were saved.", { completed: finishedCount })
+          : t("Checked {total} nodes: {alive} alive.", { total: finishedCount, alive: aliveCount }));
+      }
+    } catch (e) {
+      if (poolController.current === current) {
+        if (current.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
+          setNotice(t("Cancelled node check. {completed} completed results were saved.", { completed: finishedCount }));
+        } else {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }
+    } finally {
+      if (poolController.current === current) {
+        poolController.current = null;
+        setPoolCheckProgress(null);
+        setPoolBusy(null);
+      }
+    }
+  };
+
+  const handleDeletePoolNodes = async (ids: string[]) => {
+    if (!ids.length) return;
+    setPoolBusy("delete"); setError(null); setNotice(null);
+    try {
+      const deleted = await deleteProxyPoolNodes(ids);
+      setSelectedNodeIds((prev) => prev.filter((id) => !ids.includes(id)));
+      setNotice(t("Deleted {count} proxy nodes.", { count: deleted }));
+      await loadPool();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPoolBusy(null);
+    }
+  };
+
+  const handleDeleteFailedPoolNodes = async () => {
+    if (!failedPoolNodeIds.length) return;
+    if (!confirm(t("Delete {count} failed proxy nodes from the current filter?", { count: failedPoolNodeIds.length }))) return;
+    await handleDeletePoolNodes(failedPoolNodeIds);
+  };
+
+  const handleCopyNodeUri = (node: ProxyPoolNodeView) => {
+    void navigator.clipboard?.writeText(node.value);
+    setCopiedNodeId(node.id);
+    setTimeout(() => setCopiedNodeId((cur) => (cur === node.id ? null : cur)), 1500);
+  };
+
+  const handleAssignPoolNodes = async () => {
+    const nodeById = new Map(poolNodes.map((n) => [n.id, n]));
+    const selectedSet = new Set(selectedNodeIds);
+    const orderedIds = selectedSet.size
+      ? [
+          ...filteredPoolNodes.filter((n) => selectedSet.has(n.id)).map((n) => n.id),
+          ...selectedNodeIds.filter((id) => !filteredPoolNodes.some((n) => n.id === id)),
+        ]
+      : filteredPoolNodes.map((n) => n.id);
+    const nonFailedIds = orderedIds.filter((id) => nodeById.get(id)?.lastStatus !== "failed");
+    const skippedFailed = orderedIds.length - nonFailedIds.length;
+    if (!orderedIds.length || !scopeReady) return;
+    if (!nonFailedIds.length) {
+      setError(t("All selected nodes are failed. Select working or unchecked nodes to assign."));
+      return;
+    }
+    setPoolBusy("assign"); setError(null); setNotice(null);
+    try {
+      const res = await assignProxyPoolNodes({
+        scope,
+        nodeIds: nonFailedIds,
+        preProxyNodeId: poolPreProxyId || undefined,
+        profilesPerNode: poolPerNode,
+        skipFailed: true,
+      });
+      const totalSkippedFailed = skippedFailed + (res.skippedFailedNodes ?? 0);
+      setNotice(totalSkippedFailed > 0
+        ? t("Assigned {assigned} profiles ({skipped} skipped, {failed} failed · auto-skipped {dead} dead nodes).", {
+            assigned: res.assigned, skipped: res.skipped, failed: res.failed, dead: totalSkippedFailed,
+          })
+        : t("Assigned {assigned} profiles ({skipped} skipped, {failed} failed).", {
+            assigned: res.assigned, skipped: res.skipped, failed: res.failed,
+          }));
+      await onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPoolBusy(null);
+    }
+  };
+
   const hasFailedChecks = !busy && checks.some((row) => row.status === "failed" || row.status === "unstable");
+  const allVisibleSelected = pagedPoolNodes.items.length > 0 && pagedPoolNodes.items.every((n) => selectedNodeIds.includes(n.id));
+  const allFilteredSelected = filteredPoolNodes.length > 0 && filteredPoolNodes.every((n) => selectedNodeIds.includes(n.id));
+  const failedPoolNodeIds = useMemo(
+    () => filteredPoolNodes.filter((n) => n.lastStatus === "failed").map((n) => n.id),
+    [filteredPoolNodes],
+  );
+  const sortedPreProxyNodes = useMemo(() => sortNodesForPicker(poolNodes), [poolNodes]);
 
   const tools = <>
     <div className="tools-tabs" aria-label={t("Proxy tools")}>
       <button className={task === "check" ? "selected" : ""} aria-pressed={task === "check"} onClick={() => setTask("check")}>{t("Check proxies")} <small>{t("Find connection problems")}</small></button>
       <button className={task === "replace" ? "selected" : ""} aria-pressed={task === "replace"} onClick={() => setTask("replace")}>{t("Replace proxies")} <small>{t("Assign new connections")}</small></button>
+      <button className={task === "pool" ? "selected" : ""} aria-pressed={task === "pool"} onClick={() => setTask("pool")}>{t("Node pool & subscriptions")} <small>{t("Manage sing-box nodes & chains")}</small></button>
     </div>
     <section className="tools-panel proxy-scope">
       <div className="tools-panel-head"><div><h3>{task === "replace" && <span className="tools-step">1</span>}{t("Choose folders")}</h3><p>{t("Includes every profile in these folders, across all pages.")}</p></div><span className="tools-folder-tag">{all ? t("All folders") : t("{count} selected", { count: selectedGroups.length })}</span></div>
@@ -355,21 +840,69 @@ export function ProxiesPage({ groups, folders = [], onChanged, active, profilesW
         </div>}
         {checks.length > 0 ? <>
           <div className="tools-result-bar"><h3>{t("Check results")}</h3><div className="proxy-actions">
+            <select
+              aria-label={t("Sort by")}
+              value={`${checkSortKey}:${checkSortDir}`}
+              onChange={(event) => {
+                const [k, d] = event.target.value.split(":") as [CheckSortKey, SortDir];
+                setCheckSortKey(k || "default");
+                setCheckSortDir(d === "desc" ? "desc" : "asc");
+                setCheckPage(0);
+              }}
+            >
+              <option value="default:asc">{t("Default order")}</option>
+              <option value="latency:asc">{t("Latency: low to high")}</option>
+              <option value="latency:desc">{t("Latency: high to low")}</option>
+              <option value="risk:asc">{t("Risk: low to high")}</option>
+              <option value="risk:desc">{t("Risk: high to low")}</option>
+              <option value="status:asc">{t("Status: alive first")}</option>
+              <option value="ip:asc">{t("Country / Exit IP")}</option>
+            </select>
             <label className="proxy-choice"><input type="checkbox" checked={checkFailures} onChange={(event) => { setCheckFailures(event.target.checked); setCheckPage(0); }} />{t("Only problems")}</label>
             <button type="button" className="btn" disabled={!!busy || !failedChecks.length} onClick={() => void runChecks(true)}>{t("Retry failed checks")}</button>
           </div></div>
-          <div className="proxy-table-wrap"><table className="profile-table proxy-table"><thead><tr><th>{t("Proxy address")}</th><th>{t("Connection")}</th><th>{t("Exit IP")}</th><th>{t("Used by")}</th><th>{t("Checked")}</th></tr></thead>
-            <tbody>{checkResults.items.map((row) => <tr key={`${row.key}-${row.profiles[0]?.id}`}>
-              <td className="tools-mono">{row.proxy || t("No proxy assigned")}</td><td><span className={`tools-status ${row.status}`}>{getCheckLabel(t, row.status)}</span><small>{row.reason ? getReasonLabel(t, row.reason || "") : ""}</small></td>
-              <td className="tools-mono">{row.ip || "—"}{row.country && <small>{row.country}</small>}</td><td><AffectedProfiles profiles={row.profiles} /></td>
-              <td>{new Date(row.checkedAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</td>
-            </tr>)}</tbody></table></div>
+          <div className="proxy-table-wrap"><table className="profile-table proxy-table"><thead><tr>
+            <th>{t("Proxy address")}</th>
+            <th><button type="button" className="pool-sort-btn" onClick={() => toggleCheckSort("status")}>{t("Connection")}{sortIndicator(checkSortKey, "status", checkSortDir)}</button></th>
+            <th><button type="button" className="pool-sort-btn" onClick={() => toggleCheckSort("ip")}>{t("Exit IP")}{sortIndicator(checkSortKey, "ip", checkSortDir)}</button></th>
+            <th><button type="button" className="pool-sort-btn" onClick={() => toggleCheckSort("risk")}>{t("Risk")}{sortIndicator(checkSortKey, "risk", checkSortDir)}</button></th>
+            <th><button type="button" className="pool-sort-btn" onClick={() => toggleCheckSort("latency")}>{t("Latency")}{sortIndicator(checkSortKey, "latency", checkSortDir)}</button></th>
+            <th>{t("Used by")}</th>
+            <th>{t("Checked")}</th>
+          </tr></thead>
+            <tbody>{checkResults.items.map((row) => {
+              const loc = [row.country, row.city].filter(Boolean).join(" · ");
+              const riskLabel = row.riskLevel ? getRiskLevelLabel(t, row.riskLevel) : "";
+              const ipTypeLabel = getIpTypeLabel(t, row.ipType);
+              return <tr key={`${row.key}-${row.profiles[0]?.id}`}>
+                <td className="tools-mono">{row.proxy || t("No proxy assigned")}</td>
+                <td><span className={`tools-status ${row.status}`}>{getCheckLabel(t, row.status)}</span><small>{row.reason ? getReasonLabel(t, row.reason || "") : ""}</small></td>
+                <td className="tools-mono">
+                  {row.ip || "—"}
+                  {loc && <small>{loc}</small>}
+                  {row.isp && <small className="pool-isp">{row.isp}</small>}
+                </td>
+                <td>
+                  {row.riskScore != null && row.riskLevel ? (
+                    <>
+                      <span className={`risk-badge ${row.riskLevel}`}>{riskLabel} · {row.riskScore}</span>
+                      {ipTypeLabel && <small>{ipTypeLabel}</small>}
+                    </>
+                  ) : <span className="tools-hint">—</span>}
+                </td>
+                <td className={`tools-mono latency-cell ${latencyTierClass(row.latencyMs)}`}>
+                  {row.latencyMs != null ? `${row.latencyMs} ms` : "—"}
+                </td>
+                <td><AffectedProfiles profiles={row.profiles} /></td>
+                <td>{new Date(row.checkedAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</td>
+              </tr>;
+            })}</tbody></table></div>
           {!checkResults.total && <p className="tools-hint tools-result-empty">{t("No problems found in the completed checks.")}</p>}
           <Pager {...checkResults} onPage={setCheckPage} />
         </> : <div className="tools-empty"><span className="tools-empty-symbol" aria-hidden="true">↗</span><h3>{busy === "check" ? t("Checking selected folders…") : t("Ready when you are")}</h3><p>{t("Choose your folders above, then check which proxies are alive, dead, or need attention.")}</p></div>}
       </section>
-      <p className="tools-footnote">{t("Supports HTTP and SOCKS5. HTTPS checks are not supported. Unknown means a result could not be confirmed.")}</p>
-    </> : <>
+      <p className="tools-footnote">{t("Supports HTTP, SOCKS5, and sing-box protocols (VLESS, VMess, Trojan, SS, Hysteria 2, TUIC, WireGuard) as well as chained proxies.")}</p>
+    </> : task === "replace" ? <>
       <section className="tools-panel proxy-input-panel">
         <div className="tools-panel-head"><div><h3><span className="tools-step">2</span>{t("Add replacement proxies")}</h3><p>{t("Nothing changes until you review and apply the assignments.")}</p></div></div>
         <div className="tools-panel-body">
@@ -380,7 +913,7 @@ export function ProxiesPage({ groups, folders = [], onChanged, active, profilesW
             : mode === "oldProxy" ? <>{t("Include a header row:")} <code>oldProxy,newProxy</code>. {t("Each old proxy is replaced wherever it appears in the selected folders.")}</>
             : t("Paste one proxy per line. We match them to profiles in profile-ID order. Each proxy is used for the number of profiles you set below. You will see every assignment next.")}</p>
           {mode === "list" && <label className="fld"><span>{t("Profiles per proxy")}</span><input type="number" aria-label={t("Profiles per proxy")} min={1} step={1} value={perProxy} disabled={!!busy} onChange={(event) => { setPerProxy(Math.max(1, Math.floor(Number(event.target.value)) || 1)); invalidatePreview(); }} /></label>}
-          <label className="fld"><span>{mode === "list" ? t("Your new proxy list") : t("Your replacement CSV")}</span><textarea aria-label={t("Replacement input")} rows={5} value={input} disabled={!!busy} spellCheck={false} autoComplete="off" placeholder={mode === "list" ? "proxy.example.com:8080:username:password\nsocks5://username:password@proxy.example.com:1080" : mode === "profileId" ? "profileId,type,host,port,user,pass" : "oldProxy,newProxy"} onChange={(event) => { setInput(event.target.value); invalidatePreview(); }} /></label>
+          <label className="fld"><span>{mode === "list" ? t("Your new proxy list") : t("Your replacement CSV")}</span><textarea aria-label={t("Replacement input")} rows={5} value={input} disabled={!!busy} spellCheck={false} autoComplete="off" placeholder={mode === "list" ? "proxy.example.com:8080:username:password\nsocks5://username:password@proxy.example.com:1080\nvless://uuid@node.example.com:443?security=reality&pbk=...#US-1\nhy2://password@node.example.com:443?sni=example.com#JP-1" : mode === "profileId" ? "profileId,type,host,port,user,pass" : "oldProxy,newProxy"} onChange={(event) => { setInput(event.target.value); invalidatePreview(); }} /></label>
           <div className="tools-result-bar"><label className="proxy-upload">{t("Or upload a file")}<input type="file" accept=".csv,.txt,text/csv,text/plain" disabled={!!busy} onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void loadFile(file); }} /></label>
             <button type="button" className="btn primary" disabled={!!busy || !scopeReady || !input.trim()} onClick={() => void makePreview()}>{busy === "preview" ? t("Preparing preview…") : t("Preview changes")}</button></div>
         </div>
@@ -407,6 +940,310 @@ export function ProxiesPage({ groups, folders = [], onChanged, active, profilesW
             </tr>)}</tbody></table></div>
           <Pager {...replacements} onPage={setReplacementPage} />
         </> : <div className="tools-empty compact"><p>{t("Your preview will appear here. Saved sessions and fingerprints stay unchanged.")}</p></div>}
+      </section>
+    </> : <>
+      <section className="tools-panel">
+        <div className="tools-panel-head">
+          <div>
+            <h3>{t("sing-box kernel")}</h3>
+            <p>{t("Required for VLESS, VMess, Trojan, SS, Hysteria 2, TUIC, WireGuard, and chained proxies.")}</p>
+          </div>
+          <div className="proxy-actions">
+            <span className={`tools-status ${kernel?.installed ? "working" : "missing"}`}>
+              {kernel?.installed ? `${t("Installed")} (v${kernel.version})` : t("Not installed")}
+            </span>
+            {!kernel?.installed && (
+              <button type="button" className="btn primary" disabled={poolBusy !== null} onClick={() => void handleInstallKernel()}>
+                {poolBusy === "kernel" ? t("Installing…") : t("Install sing-box")}
+              </button>
+            )}
+          </div>
+        </div>
+        {kernel?.path && <div className="tools-panel-body"><span className="tools-mono tools-hint">{kernel.path}</span></div>}
+      </section>
+
+      <section className="tools-panel">
+        <div className="tools-panel-head">
+          <div>
+            <h3>{t("Subscriptions")}</h3>
+            <p>{t("Add subscription links to sync VLESS, VMess, Trojan, SS, Hysteria 2, or Clash YAML nodes.")}</p>
+          </div>
+        </div>
+        <div className="tools-panel-body">
+          <div className="pool-sub-form">
+            <input value={subName} disabled={poolBusy !== null} placeholder={t("Subscription name (optional)")} onChange={(e) => setSubName(e.target.value)} />
+            <input value={subUrl} disabled={poolBusy !== null} placeholder={t("Subscription URL")} onChange={(e) => setSubUrl(e.target.value)} />
+            <button type="button" className="btn primary" disabled={poolBusy !== null || !subUrl.trim()} onClick={() => void handleAddSub()}>
+              {poolBusy === "sub" ? t("Syncing…") : t("Add & sync")}
+            </button>
+          </div>
+          <label className="proxy-choice">
+            <input
+              type="checkbox"
+              checked={subUseLocalClash}
+              disabled={poolBusy !== null}
+              onChange={(e) => setSubUseLocalClash(e.target.checked)}
+            />
+            <span>{t("Fetch subscriptions via local Clash")}</span>
+          </label>
+          {subscriptions.length > 0 ? (
+            <div className="pool-sub-list">
+              {subscriptions.map((sub) => (
+                <div className="pool-sub-row" key={sub.id}>
+                  <div className="pool-sub-meta">
+                    <strong>{sub.name}</strong>
+                    <span className="tools-folder-tag">{t("{count} nodes", { count: sub.nodeCount })}</span>
+                    {sub.userInfo?.total ? (
+                      <small>{formatBytes((sub.userInfo.upload ?? 0) + (sub.userInfo.download ?? 0))} / {formatBytes(sub.userInfo.total)}</small>
+                    ) : null}
+                    {sub.lastError && <small className="pool-err-inline">{sub.lastError}</small>}
+                  </div>
+                  <div className="proxy-actions">
+                    <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleRefreshSub(sub.id)}>{t("Refresh")}</button>
+                    <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleDeleteSub(sub.id)}>{t("Delete")}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : <p className="tools-hint">{t("No subscriptions added yet.")}</p>}
+        </div>
+      </section>
+
+      <section className="tools-panel proxy-input-panel">
+        <div className="tools-panel-head">
+          <div>
+            <h3>{t("Import proxy nodes")}</h3>
+            <p>{t("Paste one or more share URIs (vless://, vmess://, trojan://, ss://, hy2://, tuic://, wg://, socks5://, http://), Base64, or Clash YAML.")}</p>
+          </div>
+        </div>
+        <div className="tools-panel-body">
+          <textarea
+            rows={4}
+            value={nodePaste}
+            disabled={poolBusy !== null}
+            spellCheck={false}
+            autoComplete="off"
+            placeholder={"vless://uuid@example.com:443?security=reality&pbk=...#US-Transit\nsocks5://user:pass@203.0.113.10:1080"}
+            onChange={(e) => setNodePaste(e.target.value)}
+          />
+          <div className="tools-result-bar">
+            <span />
+            <button type="button" className="btn primary" disabled={poolBusy !== null || !nodePaste.trim()} onClick={() => void handleImportNodes()}>
+              {poolBusy === "import" ? t("Importing nodes…") : t("Import nodes")}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="tools-panel">
+        <div className="tools-panel-head">
+          <div>
+            <h3>{t("Node pool")} <span className="tools-folder-tag">{t("{count} nodes", { count: filteredPoolNodes.length })}</span></h3>
+            <p>{t("Select nodes to check connectivity or assign to profiles in the chosen folders above.")}</p>
+          </div>
+          <div className="proxy-actions">
+            {selectedNodeIds.length > 0 && (
+              <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleCheckPoolNodes(selectedNodeIds)}>
+                {poolBusy === "check" ? t("Checking…") : `${t("Check selected")} (${selectedNodeIds.length})`}
+              </button>
+            )}
+            <button type="button" className="btn" disabled={poolBusy !== null || !filteredPoolNodes.length} onClick={() => void handleCheckPoolNodes(filteredPoolNodes.map((n) => n.id))}>
+              {poolBusy === "check" ? t("Checking…") : `${t("Check all")} (${filteredPoolNodes.length})`}
+            </button>
+            <button type="button" className="btn primary" disabled={poolBusy !== null || !scopeReady || !filteredPoolNodes.length} onClick={() => void handleAssignPoolNodes()}>
+              {poolBusy === "assign" ? t("Assigning…") : t("Assign to folders")}
+            </button>
+            {failedPoolNodeIds.length > 0 && (
+              <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleDeleteFailedPoolNodes()}>
+                {t("Delete failed")} ({failedPoolNodeIds.length})
+              </button>
+            )}
+            {selectedNodeIds.length > 0 && (
+              <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleDeletePoolNodes(selectedNodeIds)}>
+                {t("Delete selected")} ({selectedNodeIds.length})
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="tools-panel-body">
+          {poolBusy === "check" && poolCheckProgress && (
+            <div className="tools-progress" role="status">
+              <div className="proxy-actions">
+                <strong>
+                  {t("Checking nodes")}: {poolCheckProgress.completed.toLocaleString()} / {poolCheckProgress.total.toLocaleString()}
+                </strong>
+                <button type="button" className="btn" onClick={() => poolController.current?.abort()}>{t("Cancel")}</button>
+              </div>
+              <progress
+                aria-label={t("Checking nodes")}
+                value={poolCheckProgress.completed}
+                max={Math.max(1, poolCheckProgress.total)}
+              />
+            </div>
+          )}
+          <div className="pool-controls">
+            <input value={poolQuery} placeholder={t("Filter by name, host, IP, ISP, protocol, or country…")} onChange={(e) => { setPoolQuery(e.target.value); setPoolPage(0); }} />
+            <select value={poolSource} onChange={(e) => { setPoolSource(e.target.value); setPoolPage(0); }}>
+              <option value="all">{t("All sources")}</option>
+              <option value="manual">{t("Manual nodes")}</option>
+              {subscriptions.map((sub) => <option key={sub.id} value={sub.id}>{sub.name}</option>)}
+            </select>
+            <select value={poolRiskFilter} aria-label={t("Filter by risk level")} onChange={(e) => { setPoolRiskFilter(e.target.value as PoolRiskFilter); setPoolPage(0); }}>
+              <option value="all">{t("All risks & statuses")}</option>
+              <option value="working">{t("Alive only")}</option>
+              <option value="low">{t("Low risk (0–34)")}</option>
+              <option value="medium_or_low">{t("Low & medium risk (0–69)")}</option>
+              <option value="high">{t("High risk (70–100)")}</option>
+              <option value="unchecked">{t("Unchecked")}</option>
+            </select>
+            <select
+              aria-label={t("Sort by")}
+              value={`${poolSortKey}:${poolSortDir}`}
+              onChange={(e) => {
+                const [k, d] = e.target.value.split(":") as [PoolSortKey, SortDir];
+                setPoolSortKey(k || "default");
+                setPoolSortDir(d === "desc" ? "desc" : "asc");
+                setPoolPage(0);
+              }}
+            >
+              <option value="default:asc">{t("Default order")}</option>
+              <option value="latency:asc">{t("Latency: low to high")}</option>
+              <option value="latency:desc">{t("Latency: high to low")}</option>
+              <option value="risk:asc">{t("Risk: low to high")}</option>
+              <option value="risk:desc">{t("Risk: high to low")}</option>
+              <option value="status:asc">{t("Status: alive first")}</option>
+              <option value="country:asc">{t("Country / Exit IP")}</option>
+              <option value="protocol:asc">{t("Protocol")}</option>
+              <option value="name:asc">{t("Node name")}</option>
+            </select>
+          </div>
+          <div className="pool-controls-row2">
+            <select value={poolPreProxyId} aria-label={t("Transit / pre-proxy (optional chain)")} onChange={(e) => setPoolPreProxyId(e.target.value)}>
+              <option value="">{t("No pre-proxy (direct to node)")}</option>
+              <option value="__local_clash__">{t("Local Clash (host proxy)")}</option>
+              {sortedPreProxyNodes.map((n) => <option key={n.id} value={n.id}>{formatPoolPickerOption(n, t)}</option>)}
+            </select>
+            <label className="proxy-choice">
+              <span>{t("Profiles per node")}</span>
+              <input type="number" className="pool-per-node" min={1} step={1} value={poolPerNode} onChange={(e) => setPoolPerNode(Math.max(1, Math.floor(Number(e.target.value)) || 1))} />
+            </label>
+            <label className="proxy-choice">
+              <input
+                type="checkbox"
+                checked={poolIncludeRisk}
+                disabled={poolBusy === "check"}
+                onChange={(e) => setPoolIncludeRisk(e.target.checked)}
+              />
+              <span>{t("Also check IP risk")}</span>
+            </label>
+            {filteredPoolNodes.length > 0 && (
+              <button
+                type="button"
+                className="btn"
+                disabled={poolBusy !== null}
+                onClick={() => {
+                  const filteredIds = filteredPoolNodes.map((n) => n.id);
+                  setSelectedNodeIds((prev) => allFilteredSelected
+                    ? prev.filter((id) => !filteredIds.includes(id))
+                    : [...new Set([...prev, ...filteredIds])]);
+                }}
+              >
+                {allFilteredSelected
+                  ? t("Clear selection")
+                  : t("Select all filtered ({count})", { count: filteredPoolNodes.length })}
+              </button>
+            )}
+          </div>
+        </div>
+        {pagedPoolNodes.items.length > 0 ? <>
+          <div className="proxy-table-wrap">
+            <table className="profile-table proxy-table pool-table">
+              <thead>
+                <tr>
+                  <th className="tools-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={allVisibleSelected}
+                      onChange={(e) => {
+                        const pageIds = pagedPoolNodes.items.map((n) => n.id);
+                        setSelectedNodeIds((prev) => e.target.checked
+                          ? [...new Set([...prev, ...pageIds])]
+                          : prev.filter((id) => !pageIds.includes(id)));
+                      }}
+                    />
+                  </th>
+                  <th><button type="button" className="pool-sort-btn" onClick={() => togglePoolSort("name")}>{t("Node")}{sortIndicator(poolSortKey, "name", poolSortDir)}</button></th>
+                  <th><button type="button" className="pool-sort-btn" onClick={() => togglePoolSort("protocol")}>{t("Protocol")}{sortIndicator(poolSortKey, "protocol", poolSortDir)}</button></th>
+                  <th>{t("Address")}</th>
+                  <th><button type="button" className="pool-sort-btn" onClick={() => togglePoolSort("status")}>{t("Connection")}{sortIndicator(poolSortKey, "status", poolSortDir)}</button></th>
+                  <th><button type="button" className="pool-sort-btn" onClick={() => togglePoolSort("country")}>{t("Exit IP")}{sortIndicator(poolSortKey, "country", poolSortDir)}</button></th>
+                  <th><button type="button" className="pool-sort-btn" onClick={() => togglePoolSort("risk")}>{t("Risk")}{sortIndicator(poolSortKey, "risk", poolSortDir)}</button></th>
+                  <th><button type="button" className="pool-sort-btn" onClick={() => togglePoolSort("latency")}>{t("Latency")}{sortIndicator(poolSortKey, "latency", poolSortDir)}</button></th>
+                  <th>{t("Actions")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pagedPoolNodes.items.map((node) => {
+                  const checked = selectedNodeIds.includes(node.id);
+                  const loc = [node.lastCountry, node.lastCity].filter(Boolean).join(" · ");
+                  const riskLabel = node.lastRiskLevel ? getRiskLevelLabel(t, node.lastRiskLevel) : "";
+                  const ipTypeLabel = getIpTypeLabel(t, node.lastIpType);
+                  const riskTitle = node.lastRiskFlags?.length ? node.lastRiskFlags.join(", ") : undefined;
+                  return (
+                    <tr key={node.id}>
+                      <td className="tools-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => setSelectedNodeIds((prev) => e.target.checked ? [...prev, node.id] : prev.filter((id) => id !== node.id))}
+                        />
+                      </td>
+                      <td><strong>{node.name}</strong>{node.hasChain && <small>{t("Chain active")}</small>}</td>
+                      <td><span className="tools-folder-tag">{node.type.toUpperCase()}</span></td>
+                      <td className="tools-mono">{node.host}:{node.port}</td>
+                      <td>
+                        {node.lastStatus ? (
+                          <>
+                            <span className={`tools-status ${node.lastStatus}`}>{getCheckLabel(t, node.lastStatus)}</span>
+                            {node.lastReason && <small>{getReasonLabel(t, node.lastReason)}</small>}
+                          </>
+                        ) : <span className="tools-hint">—</span>}
+                      </td>
+                      <td className="tools-mono">
+                        {node.lastIp || "—"}
+                        {loc && <small>{loc}</small>}
+                        {node.lastIsp && <small className="pool-isp">{node.lastIsp}</small>}
+                      </td>
+                      <td>
+                        {node.lastRiskScore != null && node.lastRiskLevel ? (
+                          <>
+                            <span className={`risk-badge ${node.lastRiskLevel}`} title={riskTitle}>{riskLabel} · {node.lastRiskScore}</span>
+                            {ipTypeLabel && <small>{ipTypeLabel}</small>}
+                          </>
+                        ) : <span className="tools-hint">—</span>}
+                      </td>
+                      <td className={`tools-mono latency-cell ${latencyTierClass(node.lastLatencyMs)}`}>
+                        {node.lastLatencyMs != null ? `${node.lastLatencyMs} ms` : "—"}
+                      </td>
+                      <td>
+                        <div className="proxy-actions">
+                          <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleCheckPoolNodes([node.id])}>{t("Check proxies")}</button>
+                          <button type="button" className="btn" onClick={() => handleCopyNodeUri(node)}>{copiedNodeId === node.id ? t("Copied") : t("Copy link")}</button>
+                          <button type="button" className="btn" disabled={poolBusy !== null} onClick={() => void handleDeletePoolNodes([node.id])}>{t("Delete")}</button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <Pager {...pagedPoolNodes} onPage={setPoolPage} />
+        </> : (
+          <div className="tools-empty compact">
+            <p>{poolNodes.length > 0 ? t("No proxy nodes match the current filters.") : t("No proxy nodes in your pool yet. Add a subscription or paste node links above.")}</p>
+          </div>
+        )}
       </section>
     </>}
   </>;

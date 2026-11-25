@@ -22,7 +22,9 @@ export interface CookieRecord {
   _crHasCrossSiteAncestor?: boolean;
 }
 
-export type ProxyType = "http" | "https" | "socks5";
+export type StandardProxyType = "http" | "https" | "socks5";
+export type SingBoxProxyType = "vless" | "vmess" | "trojan" | "ss" | "hysteria2" | "tuic" | "wireguard";
+export type ProxyType = StandardProxyType | SingBoxProxyType;
 
 /** Browser engine that owns this profile's identity. Missing legacy values mean Chromium. */
 export type ProfileEngine = "chromium" | "firefox";
@@ -55,6 +57,53 @@ export interface ProxySpec {
   port: string;
   user: string;
   pass: string;
+  /** Full share URI for sing-box protocols (vless://, vmess://, trojan://, ss://, hy2://, tuic://, wg://). */
+  uri?: string;
+  /** Optional human-readable label (e.g. node name from URI fragment or subscription). */
+  label?: string;
+  /** Optional route mode marker: "local-clash" dynamically resolves to this computer's configured local Clash proxy. */
+  mode?: "local-clash";
+  /** Optional upstream transit proxy for chained routing: Local -> preProxy -> this proxy -> Target. */
+  preProxy?: ProxySpec;
+}
+
+export interface ProxySubscriptionUserInfo {
+  upload?: number;
+  download?: number;
+  total?: number;
+  expire?: number;
+}
+
+export interface ProxySubscription {
+  id: string;
+  name: string;
+  url: string;
+  nodeCount: number;
+  lastUpdatedAt: number;
+  lastError: string;
+  userInfo?: ProxySubscriptionUserInfo;
+  createdAt: number;
+}
+
+export interface ProxyPoolNode {
+  id: string;
+  name: string;
+  subscriptionId: string;
+  proxy: ProxySpec;
+  tags: string[];
+  lastStatus: "" | "working" | "unstable" | "failed" | "unavailable";
+  lastReason?: string;
+  lastIp: string;
+  lastCountry: string;
+  lastCity?: string;
+  lastIsp?: string;
+  lastIpType?: "" | "residential" | "mobile" | "datacenter" | "vpn" | "proxy" | "tor" | "unknown";
+  lastRiskScore?: number | null;
+  lastRiskLevel?: "" | "low" | "medium" | "high";
+  lastRiskFlags?: string[];
+  lastLatencyMs: number | null;
+  lastCheckedAt: number;
+  createdAt: number;
 }
 
 /**
