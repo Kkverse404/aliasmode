@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      reuse_run_id:
+        description: Optional prior workflow run ID to reuse Windows, Linux, and macOS x64 artifacts (only builds macOS aarch64)
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -33,6 +38,7 @@ env:
 jobs:
   windows:
     name: Windows x64 (slim + offline)
+    if: ${{ inputs.reuse_run_id == '' }}
     runs-on: windows-latest
     timeout-minutes: 60
     outputs:
@@ -135,17 +141,21 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }} (dmg + tar.gz)
+    if: ${{ inputs.reuse_run_id == '' || matrix.arch == 'aarch64' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: aarch64, runner: macos-15 }
-          - { arch: x64, runner: macos-15-intel }
+          - { arch: aarch64, node_arch: arm64, lipo_arch: arm64, rust_target: aarch64-apple-darwin, runner: macos-15-intel }
+          - { arch: x64, node_arch: x64, lipo_arch: x86_64, rust_target: x86_64-apple-darwin, runner: macos-15-intel }
     env:
       ARCH: ${{ matrix.arch }}
-      BUNDLE: src-tauri/target/release/bundle
+      NODE_ARCH: ${{ matrix.node_arch }}
+      LIPO_ARCH: ${{ matrix.lipo_arch }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+      BUNDLE: src-tauri/target/${{ matrix.rust_target }}/release/bundle
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -154,13 +164,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.89
+          targets: ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: macos-${{ matrix.arch }}
           cache-on-failure: true
       - run: bun install --frozen-lockfile
       - name: Build macOS app bundle
-        run: bun run desktop:prepare:macos && bunx tauri build --bundles app
+        run: |
+          ALIASMODE_MACOS_ARCH="$NODE_ARCH" bun run desktop:prepare:macos
+          bunx tauri build --bundles app --target "$RUST_TARGET"
       - name: Build macOS DMG
         shell: bash
         run: |
@@ -189,16 +203,23 @@ jobs:
             done
           fi
           hdiutil verify "$dmg"
-      - name: Verify bundle and package macOS assets
+      - name: Verify bundle architecture, signatures, and package macOS assets
         shell: bash
         run: |
           set -euo pipefail
           version="$(jq -er .version src-tauri/tauri.conf.json)"
           app="$BUNDLE/macos/AliasMode.app"
-          for file in aliasmode aliasmode-sidecar aliasmode-mcp; do
-            test -x "$app/Contents/MacOS/$file"
+          for bin in \
+            "$app/Contents/MacOS/aliasmode" \
+            "$app/Contents/MacOS/aliasmode-sidecar" \
+            "$app/Contents/MacOS/aliasmode-mcp" \
+            "$app/Contents/Resources/firefox/AliasMode.app/Contents/MacOS/aliasmode" \
+            "$app/Contents/Resources/playwright/node/node"; do
+            test -x "$bin"
+            archs="$(lipo -archs "$bin")"
+            echo "$bin -> $archs"
+            grep -qw "$LIPO_ARCH" <<<"$archs"
           done
-          test -x "$app/Contents/Resources/playwright/node/node"
           codesign --verify --deep --strict "$app"
           codesign --verify --deep --strict "$app/Contents/Resources/firefox/AliasMode.app"
 
@@ -219,6 +240,7 @@ jobs:
 
   linux:
     name: Linux x86_64 (tar.gz + deb)
+    if: ${{ inputs.reuse_run_id == '' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -278,31 +300,67 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [windows, macos, linux]
+    if: ${{ always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download Windows artifacts (current run)
+        if: ${{ inputs.reuse_run_id == '' }}
+        uses: actions/download-artifact@v4
         with:
           name: release-windows
           path: staging/windows
-      - uses: actions/download-artifact@v4
+      - name: Download Windows artifacts (reused run)
+        if: ${{ inputs.reuse_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: staging/windows
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.reuse_run_id }}
+      - name: Download macOS aarch64 artifacts
+        uses: actions/download-artifact@v4
         with:
           name: release-macos-aarch64
           path: staging/macos-aarch64
-      - uses: actions/download-artifact@v4
+      - name: Download macOS x64 artifacts (current run)
+        if: ${{ inputs.reuse_run_id == '' }}
+        uses: actions/download-artifact@v4
         with:
           name: release-macos-x64
           path: staging/macos-x64
-      - uses: actions/download-artifact@v4
+      - name: Download macOS x64 artifacts (reused run)
+        if: ${{ inputs.reuse_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos-x64
+          path: staging/macos-x64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.reuse_run_id }}
+      - name: Download Linux artifacts (current run)
+        if: ${{ inputs.reuse_run_id == '' }}
+        uses: actions/download-artifact@v4
         with:
           name: release-linux
           path: staging/linux
+      - name: Download Linux artifacts (reused run)
+        if: ${{ inputs.reuse_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: staging/linux
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.reuse_run_id }}
       - name: Assemble, verify checksums, and publish release
         shell: bash
         env:
@@ -389,7 +447,10 @@ jobs:
             gh release edit "$tag" --title "AliasMode ${version}" --notes-file release-notes.md
             gh release upload "$tag" --clobber "${assets[@]}"
           else
-            flags=(--target "${GITHUB_SHA}" --title "AliasMode ${version}" --notes-file release-notes.md)
+            flags=(--title "AliasMode ${version}" --notes-file release-notes.md)
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              flags+=(--target "${GITHUB_SHA}")
+            fi
             if [[ "$INPUT_PRERELEASE" == "true" ]]; then
               flags+=(--prerelease)
             fi

@@ -16,8 +16,11 @@ export async function prepareMacosBundle(cwd = process.cwd()): Promise<void> {
   if (process.platform !== "darwin" || (process.arch !== "arm64" && process.arch !== "x64")) {
     throw new Error("macOS bundle preparation requires macOS");
   }
-  // Tauri builds for this Mac's processor. Every Mac that runs macOS 13, which Bun needs, has AVX2.
-  const [bunTarget, rustTarget] = process.arch === "arm64"
+  const targetArch = process.env.ALIASMODE_MACOS_ARCH === "arm64" || process.env.ALIASMODE_MACOS_ARCH === "x64"
+    ? process.env.ALIASMODE_MACOS_ARCH
+    : process.arch;
+  // Tauri builds for the selected Mac processor. Every Mac that runs macOS 13, which Bun needs, has AVX2.
+  const [bunTarget, rustTarget] = targetArch === "arm64"
     ? ["bun-darwin-arm64", "aarch64-apple-darwin"]
     : ["bun-darwin-x64", "x86_64-apple-darwin"];
   const tauri = join(resolve(cwd), "src-tauri");
@@ -31,15 +34,15 @@ export async function prepareMacosBundle(cwd = process.cwd()): Promise<void> {
 
   await compileSidecar(cwd, join(tauri, "binaries", `aliasmode-sidecar-${rustTarget}`), bunTarget);
 
-  const build = firefoxBuildForHost();
-  const firefox = await installFirefox({ cwd: staging, writeEnv: false });
+  const build = firefoxBuildForHost("darwin", targetArch);
+  const firefox = await installFirefox({ cwd: staging, platform: "darwin", arch: targetArch, writeEnv: false });
   renameSync(resolve(firefox.path, ...build.executablePath.split("/").map(() => "..")), firefoxRoot);
   // The published engine bundle has no resource seal, so macOS reports its signature as broken.
   // Seal it after the pinned hashes passed; the packaged hash below is the sealed executable.
   await run(["codesign", "--force", "--deep", "--sign", "-", join(firefoxRoot, "AliasMode.app")]);
   const firefoxSha256 = await sha256File(join(firefoxRoot, build.executablePath));
 
-  cpSync(await installSourceNode(staging), join(playwrightRoot, "node", "node"));
+  cpSync(await installSourceNode(staging, { platform: "darwin", arch: targetArch }), join(playwrightRoot, "node", "node"));
   stageAgentRuntime(cwd, playwrightRoot);
 
   const metadata = {
