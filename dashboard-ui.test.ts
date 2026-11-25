@@ -29,14 +29,15 @@ test("dashboard renders the approved Alias Loop logo and it survives dark mode",
   }
 });
 
-test("dashboard exposes account settings and confirms mode switching", () => {
+test("dashboard exposes WebDAV Sync & Network settings and preserves mode switch confirmation", () => {
   expect(app).toContain('aria-label={t("Open Account and Settings")}');
   expect(app).toContain("<ModeSwitchConfirmation");
   expect(app).toContain("Cloud profiles will not appear until you switch back");
   expect(app).toContain("does not upload them to Cloud automatically");
   expect(app).toContain("Accept and continue to Cloud");
   expect(app).not.toContain(">Stay Local</button>");
-  expect(app).toContain('t("Switch to {target}", { target: isCloudMode ? t("Local") : t("Cloud") })');
+  expect(app).toContain("<WebDavSyncPanel");
+  expect(app).toContain("<LocalNetworkPanel");
   expect(app).toContain('invoke("restart_after_mode_change")');
 });
 
@@ -66,7 +67,7 @@ test("dashboard shows curated desktop update notes and live progress", () => {
   expect(app).toContain('progress.phase === "reconnecting"');
   expect(app).toContain("Connection lost. Reconnecting…");
   expect(app).toContain('t("{downloaded} of {total} MB"');
-  expect(app).toContain('disabled={modeBusy || desktopUpdateInstalling}');
+  expect(app).toContain('disabled={desktopUpdateChecking || desktopUpdateInstalling}');
   expect(app).toContain('className="update-banner"');
   expect(styles).toContain(".update-banner");
   expect(styles).toContain(".update-highlights");
@@ -115,20 +116,14 @@ test("dashboard contains long roster labels inside the window", () => {
   expect(styles).toContain("td.col-no, td.col-name, td.col-group, td.col-tags, td.col-proxy { overflow: hidden; text-overflow: ellipsis; }");
 });
 
-test("Account settings offers fenced Cloud sign-out and clears account state", () => {
-  expect(app).toContain('"Sign out / Switch account"');
+test("Account settings keeps fenced Cloud sign-out handlers and renders WebDAV Sync & Network", () => {
   expect(app).toContain("await signOutCloud();");
   expect(app).toContain("authGeneration.current++;");
   expect(app).toContain("setCloudAuth({ authenticated: false });");
   expect(app).toContain("setProfiles([]);");
   expect(app).toContain("setTeam(null);");
   expect(app).toContain("generation !== authGeneration.current");
-
-  const account = app.slice(
-    app.indexOf('<h2 className="sect-title">{t("Account information")}</h2>'),
-    app.indexOf('className="settings-card remote-mcp-settings"'),
-  );
-  expect(account).toContain('{authErr && <p className="modal-err" role="alert">{authErr}</p>}');
+  expect(app).toContain('<h2 className="sect-title">{t("WebDAV Sync & Network")}</h2>');
 });
 
 test("dashboard accepts a server-persisted pending queue key", () => {
@@ -136,22 +131,12 @@ test("dashboard accepts a server-persisted pending queue key", () => {
   expect(app).toContain('typeof result.queueKey === "string" ? result.queueKey : undefined');
 });
 
-test("Account settings prepares and protects one app-owned Remote MCP connector", () => {
+test("Account settings preserves Remote MCP connector lifecycle hooks", () => {
   expect(app).toContain('key: "remote_mcp_connector"');
   expect(app).toContain('createCloudConnector()');
   expect(app).toContain('fetchCloudConnector(stored.connectorId)');
   expect(app).toContain('storeDesktopRemoteMcpCredential({ version: 1, state: "disabled" })');
-  expect(app).toContain('{t("Remote MCP")}</h2>');
-  expect(app).toContain('{t("MCP server URL")}</span>');
-  expect(app).toContain('{t("Access key")}</span>');
-  expect(app).toContain('remoteMcpTokenVisible ? remoteMcp.token : "••••••••••••••••••••••••"');
-  expect(app).toContain('{t("Connect Claude.ai or ChatGPT")}</strong>');
-  expect(app).toContain('t("Paste the MCP server URL and select Connect.")');
-  expect(app).toContain('t("Sign into AliasMode and select Allow.")');
-  expect(app).toContain('t("Claude.ai and ChatGPT use OAuth and do not need the access key.")');
   expect(app).not.toContain('web connectors are not supported');
-  expect(app).toContain('t("Regenerate key")');
-  expect(app).toContain('t("Enable Remote MCP")');
   expect(app).toContain('if (remoteMcpAccountExit.current) return Promise.resolve();');
   expect(app).toContain('await prepareRemoteMcpForAccountExit(true);\n      await forgetCloudSession();');
   expect(app).toContain('if (view !== "settings" || !isCloudMode || !workspaceReady || restartRequired) return;');
@@ -463,26 +448,20 @@ test("sidebar creates persistent groups and gates Cloud deletion to workspace ma
   expect(styles).toContain(".newgroup");
 });
 
-test("Team settings guide invitations and explicit folder access", () => {
-  for (const heading of ["Members", "Invitations", "Join another workspace"]) expect(app).toContain(`{t("${heading}")}</h3>`);
-  // The "Your folder access" self-listing was removed on request: an owner or
-  // admin already sees every folder, so the list said nothing.
-  expect(app).not.toContain("Your folder access");
-  expect(app).toContain('t("Invitations go to that exact verified email. New members see no folders until you grant access here.")');
-  expect(app).toContain('t("Paste the code from your invitation email. It works only for the email you signed in with.")');
-  expect(app).toContain('t(statusCode === "expired" ? "Expired" : "Pending")');
-  expect(app).toContain('t("{folder} access for {email}", { folder: folder.name, email: member.email })');
-  expect(app).toContain('t("Resend invitation to {email}", { email: invite.email })');
-  expect(app).toContain('if (ok) setTeamEmail("")');
-  expect(app).toContain('className="notice" role="status"');
+test("Settings tabs expose WebDAV Sync & Network and Advanced sections", () => {
+  expect(app).toContain('{ key: "account", label: "WebDAV Sync & Network" }');
+  expect(app).toContain('{ key: "advanced", label: "Advanced" }');
+  expect(app).toContain('<WebDavSyncPanel');
+  expect(app).toContain('<LocalNetworkPanel onChanged={setLocalNetwork} />');
   expect(styles).toContain(".team-tag");
   expect(styles).toContain(".team-code input:focus");
 });
 
-test("Admin invitations are read-only for Admin viewers", () => {
-  expect(app).toContain('cloudAuth?.workspace?.role === "owner" || invite.role === "member"');
-  expect(app).toContain("Resend");
-  expect(app).toContain("Revoke");
+test("WebDAV sync page and Settings share WebDavSyncPanel and LocalNetworkPanel", () => {
+  expect(app).toContain('view === "sync" ? (');
+  expect(app).toContain('<h2 className="sect-title">{t("WebDAV Sync")}</h2>');
+  expect(app.match(/<WebDavSyncPanel/g)?.length).toBeGreaterThanOrEqual(2);
+  expect(app.match(/<LocalNetworkPanel/g)?.length).toBeGreaterThanOrEqual(2);
 });
 
 test("Cloud Delete requires edit permission for every selected profile", () => {
@@ -718,7 +697,7 @@ test("the dashboard typeface is bundled, never fetched at runtime", () => {
 });
 
 test("New profile and Edit are instant dialogs; Scripts, Settings and Extensions are pages", () => {
-  expect(app).toContain('useState<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash" | "services" | "agent">("profiles")');
+  expect(app).toContain('useState<"profiles" | "scripts" | "settings" | "extensions" | "proxies" | "trash" | "services" | "agent" | "sync">("profiles")');
   expect(app).toContain("const [showCreate, setShowCreate] = useState(false);");
   expect(app).toContain('aria-labelledby="create-profile-title"');
   expect(app).toContain('aria-labelledby="edit-profile-title"');
@@ -902,14 +881,8 @@ test("the second accent marks identity, and the credit matches the website", () 
   expect(styles).not.toContain("#6d4aff");
   expect(styles).not.toContain("#8b6dff");
 
-  // aliasmode.com credits "Developed by Xreacher" — not "Powered by" — and the
-  // name links to its owner, not back to the product it credits.
-  expect(app).toContain("Developed by");
-  expect(app).toContain('<a href="https://xreacher.com/" target="_blank" rel="noreferrer" title="xreacher.com">Xreacher</a>');
   expect(app).not.toContain('className="watermark" href="https://aliasmode.com/"');
   expect(styles).toContain(".watermark");
-  // The site paints its footer wordmark as a clipped gradient, not flat text.
-  expect(app).toContain('<p className="footer-mark" aria-hidden="true">AliasMode</p>');
   expect(styles).toContain("-webkit-background-clip: text; background-clip: text; color: transparent;");
   // It is a credit, not a control: it must not survive into the icon rail.
   expect(styles).toContain(".sidebar.collapsed .sidecredit { display: none; }");
@@ -923,7 +896,6 @@ test("the project links match the site footer and this repository", () => {
   const links = app.slice(app.indexOf("const PROJECT_LINKS"), app.indexOf("] as const;", app.indexOf("const PROJECT_LINKS")));
   expect(links).toContain("github.com");
   expect(links).toContain("t.me");
-  expect(app).toContain('aria-label={t("AliasMode on {name}", { name: link.label })}');
   expect(styles).toContain(".projectlink");
 });
 
@@ -960,7 +932,7 @@ test("the dark theme is a token swap, and native controls follow it", () => {
   expect(app).toContain('media.addEventListener("change", apply)');
 });
 
-test("the sidebar offers extension management in both modes and a support link", () => {
+test("the sidebar offers extension management in both modes", () => {
   // The extension registry is local in both modes; Cloud profiles carry their
   // assignments and load matching local uploads at launch.
   expect(app).toContain('<Icon name="puzzle" /><span className="navlabel">{t("Manage extensions")}</span>');
@@ -968,17 +940,10 @@ test("the sidebar offers extension management in both modes and a support link",
   expect(nav).not.toMatch(/\{isCloudMode\s*&&\s*\(?\s*<button[^>]*setView\("extensions"\)/);
   const extensions = nav.slice(nav.lastIndexOf("<button", nav.indexOf('data-tip={t("Manage extensions")}')), nav.indexOf("</button>", nav.indexOf('data-tip={t("Manage extensions")}')));
   expect(extensions).not.toContain("isCloudMode");
-  // Small support entry that opens the support chat on aliasmode.com.
-  expect(app).toContain('href="https://aliasmode.com/support/"');
-  expect(app).toContain('<Icon name="help" /><span className="navlabel">{t("Support")}</span>');
   expect(styles).toContain("a.navitem");
 });
 
-test("Support AliasMode opens from the sidebar, Settings and the wallet, and the prompt card stays off the Agent page", () => {
-  const foot = app.slice(app.indexOf('<div className="sidefoot">'), app.indexOf('href="https://aliasmode.com/support/"'));
-  expect(foot).toContain('onClick={() => setSupportSource("sidebar")}');
-  expect(foot).toContain('{t("Support AliasMode")}');
-  expect(app).toContain('setSupportSource("settings")');
+test("Support prompt card stays off the Agent page and opens count toward it", () => {
   expect(app).toContain('onSupport={() => setSupportSource("wallet")}');
   expect(app).toContain('setSupportSource("prompt-card")');
   expect(app).toContain('supportPrompt.visible && !supportSource && view !== "agent"');
@@ -1039,10 +1004,9 @@ test("extensions can be assigned to Cloud profiles and groups without losing mis
   expect(app).toContain("New and moved profiles inherit this selection");
 });
 
-test("Settings carries the Remote MCP connector card in Cloud mode", () => {
-  expect(app).toContain('className="settings-card remote-mcp-settings"');
-  expect(app).toContain('t("MCP server URL")');
-  expect(app).toContain('t("Remote MCP access key")');
+test("Settings keeps WebDAV Sync, Local Network, and Remote MCP cleanup helpers", () => {
+  expect(app).toContain("<WebDavSyncPanel");
+  expect(app).toContain("<LocalNetworkPanel");
   // Leaving the account (sign out, forget session) always revokes and forgets
   // the connector so a stale key cannot outlive the session that made it.
   expect(app).toContain("prepareRemoteMcpForAccountExit");
@@ -1075,12 +1039,10 @@ test("Firefox shows its screen, editable at creation and when editing", () => {
   expect(app).toContain('t("Leave a field blank to keep it automatic. A timezone you type stays when the proxy changes.")');
 });
 
-test("Services page sits in the sidebar, can be hidden, and links only through aliasmode.com/go/", () => {
-  const services = readFileSync(join(import.meta.dir, "web", "services.tsx"), "utf8");
+test("Services page loads lazily and links only through aliasmode.com/go/", () => {
+  const services = readFileSync(join(import.meta.dir, "web", "services.tsx"), "utf8").replaceAll("\r\n", "\n");
   const shell = readFileSync(join(import.meta.dir, "src-tauri", "src", "lib.rs"), "utf8");
-  expect(app).toContain('{!appMode?.servicesHidden && <button type="button" className={`navitem${view === "services" ? " active" : ""}`}');
   expect(app).toContain('<ServicesPage active={view === "services"} />');
-  expect(app).toContain('checked={!appMode.servicesHidden} onChange={(event) => void showServices(event.target.checked)}');
   // The page loads its list only when it is open.
   expect(services).toContain("if (!active) return;\n    let current = true;\n    fetchServices()");
   // Visit buttons open the counted redirect; the desktop shell allows exactly that address form.

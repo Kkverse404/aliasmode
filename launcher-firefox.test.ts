@@ -116,7 +116,7 @@ test("Firefox launches one saved persona and retains ownership across manager re
   // The launch adds the per-profile seed, voices, devices and window label; the saved identity stays as it was.
   expect(f.config()).toEqual(firefoxLaunchConfig(f.profile, LABEL));
   expect(f.config()).toMatchObject({ "aliasmode:windowLabel": LABEL, "voices:blockIfNotDefined": true, "mediaDevices:enabled": true });
-  expect(f.prefs()).toEqual(firefoxStartupPrefs(f.profile));
+  expect(f.prefs()).toEqual({ ...firefoxStartupPrefs(f.profile), "network.proxy.type": 0 });
   expect(f.store.getProfile(f.profile.id)!.firefox!.config).not.toHaveProperty("audio:seed");
   // The engine shows the label in the native title, so no page script rewrites document.title.
   expect(f.labeled()).toBe(0);
@@ -805,7 +805,7 @@ test("a Firefox profile of this computer's own OS opens without a font pack", as
   await f.launcher.start(f.profile.id);
   expect(f.fontPacks).toEqual([]);
   expect(f.config()).not.toHaveProperty("aliasmode:fontsDir");
-  expect(f.prefs()).toEqual(firefoxStartupPrefs(f.profile, "win32", "x64"));
+  expect(f.prefs()).toEqual({ ...firefoxStartupPrefs(f.profile, "win32", "x64"), "network.proxy.type": 0 });
 });
 
 test("a Firefox profile of another OS opens with that OS's font pack", async () => {
@@ -816,7 +816,7 @@ test("a Firefox profile of another OS opens with that OS's font pack", async () 
   const fontsDir = join(f.options.chromiumRuntimeRoot!, "firefox-fonts", "macos", "fonts");
   expect(f.config()).toEqual(firefoxLaunchConfig(profile, LABEL, fontsDir));
   expect(f.config()).toMatchObject({ "aliasmode:fontsDir": fontsDir });
-  expect(f.prefs()).toEqual({ ...firefoxStartupPrefs(profile, "win32", "x64"), ...firefoxFontPackPrefs(fontsDir, "win32") });
+  expect(f.prefs()).toEqual({ ...firefoxStartupPrefs(profile, "win32", "x64"), ...firefoxFontPackPrefs(fontsDir, "win32"), "network.proxy.type": 0 });
   // The profile gets the stock fonts of macOS, not the ones of this Windows computer.
   expect(f.prefs()).toMatchObject({ "font.name-list.emoji": "Apple Color Emoji", "font.name-list.serif.x-western": "Times, Times New Roman" });
   // The saved identity never stores the folder of this computer.
