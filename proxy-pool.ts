@@ -460,13 +460,15 @@ export async function handleProxyPoolRequest(
             } else {
               const startedAt = Date.now();
               try {
+                const skipDirect = shouldSkipDirectCompare(effectiveProxy);
                 const checkOpts: ProxyCheckOptions = {
                   attempts: 1,
                   reuseRelay: true,
                   measureLatency: true,
                   includeRisk,
-                  direct: shouldSkipDirectCompare(effectiveProxy) ? null : sharedDirect,
-                  timeoutMs: 6_000,
+                  direct: skipDirect ? null : sharedDirect,
+                  skipDirect,
+                  timeoutMs: 8_000,
                 };
                 const res = injectedCheck
                   ? await injectedCheck(effectiveProxy, checkOpts)
@@ -543,7 +545,7 @@ export async function handleProxyPoolRequest(
           }
         };
 
-        await Promise.all(Array.from({ length: Math.min(8, total) }, worker));
+        await Promise.all(Array.from({ length: Math.min(6, total) }, worker));
         return { results, completed, cancelled: isCancelled() && completed < total };
       };
 

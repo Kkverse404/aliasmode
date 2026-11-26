@@ -19,11 +19,20 @@ export const MAX_PROXY_CHAIN_DEPTH = 4;
 
 export interface SingBoxConfig {
   log: { level: string; timestamp: boolean };
-  dns: { servers: Array<Record<string, unknown>>; final?: string };
+  dns: {
+    servers: Array<Record<string, unknown>>;
+    rules?: Array<Record<string, unknown>>;
+    final?: string;
+  };
   inbounds: Array<Record<string, unknown>>;
   outbounds: Array<Record<string, unknown>>;
   endpoints?: Array<Record<string, unknown>>;
   route: Record<string, unknown>;
+}
+
+export interface BuildSingBoxConfigOptions {
+  /** Pre-resolved IPv4/IPv6 addresses keyed by lowercase proxy hostname to avoid cold per-process DoH stalls. */
+  predefinedHosts?: Record<string, string[]>;
 }
 
 /**
@@ -71,12 +80,21 @@ function buildSingBoxDnsConfig(): {
     dns: {
       servers: [
         { type: "https", tag: "doh-ali", server: "223.5.5.5", server_port: 443, path: "/dns-query" },
+        { type: "https", tag: "doh-ali-backup", server: "223.6.6.6", server_port: 443, path: "/dns-query" },
         { type: "https", tag: "doh-dnspod", server: "1.12.12.12", server_port: 443, path: "/dns-query" },
       ],
       final: "doh-ali",
     },
     resolverTag: "doh-ali",
   };
+}
+
+function isLoopbackServer(host: string): boolean {
+  const normalized = host.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  return normalized === "localhost"
+    || normalized === "::1"
+    || normalized === "127.0.0.1"
+    || normalized.startsWith("127.");
 }
 
 function buildTlsObject(tls?: SingBoxTlsConfig): Record<string, unknown> | undefined {
@@ -329,10 +347,24 @@ export function flattenProxyChain(proxy: ProxySpec): ProxySpec[] {
 }
 
 /** Build a complete sing-box JSON configuration binding to 127.0.0.1:<listenPort>. */
-export function buildSingBoxConfig(proxy: ProxySpec, listenPort: number): SingBoxConfig {
+export function buildSingBoxConfig(
+  proxy: ProxySpec,
+  listenPort: number,
+  options: BuildSingBoxConfigOptions = {},
+): SingBoxConfig {
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
     throw new Error(`invalid sing-box listen port: ${listenPort}`);
   }
+  const predefined: Record<string, string[]> = {};
+  if (options.predefinedHosts) {
+    for (const [host, ips] of Object.entries(options.predefinedHosts)) {
+      const cleanHost = host.trim().toLowerCase();
+      const validIps = ips.filter(Boolean);
+      if (cleanHost && validIps.length) predefined[cleanHost] = validIps;
+    }
+  }
+  const hasPredefined = Object.keys(predefined).length > 0;
+
   const hops = flattenProxyChain(proxy);
   const outbounds: Array<Record<string, unknown>> = [];
   const endpoints: Array<Record<string, unknown>> = [];
@@ -342,15 +374,34 @@ export function buildSingBoxConfig(proxy: ProxySpec, listenPort: number): SingBo
     const tag = isFinal ? "proxy" : `chain-${i}`;
     const detour = i > 0 ? `chain-${i - 1}` : undefined;
     const built = buildHop(hops[i]!, tag, detour);
+    const serverHost = typeof built.entry.server === "string" ? built.entry.server.trim().toLowerCase() : "";
+    if (built.kind === "outbound" && serverHost && predefined[serverHost]) {
+      built.entry.domain_resolver = "hosts-pre";
+    }
     if (built.kind === "endpoint") endpoints.push(built.entry);
     else outbounds.push(built.entry);
   }
 
   const { dns, resolverTag } = buildSingBoxDnsConfig();
+  const effectiveDns: SingBoxConfig["dns"] = hasPredefined
+    ? {
+        servers: [
+          { type: "hosts", tag: "hosts-pre", predefined },
+          ...dns.servers,
+        ],
+        rules: [
+          { domain: Object.keys(predefined), server: "hosts-pre" },
+        ],
+        ...(dns.final ? { final: dns.final } : {}),
+      }
+    : dns;
+  const autoDetectInterface = process.env.ALIASMODE_SINGBOX_AUTO_DETECT_INTERFACE !== "0"
+    && hops.length > 0
+    && !isLoopbackServer(hops[0]!.host);
 
   return {
     log: { level: "error", timestamp: false },
-    dns,
+    dns: effectiveDns,
     inbounds: [
       {
         type: "mixed",
@@ -363,6 +414,7 @@ export function buildSingBoxConfig(proxy: ProxySpec, listenPort: number): SingBo
     outbounds,
     route: {
       final: "proxy",
+      ...(autoDetectInterface ? { auto_detect_interface: true } : {}),
       default_domain_resolver: {
         server: resolverTag,
         strategy: "prefer_ipv4",

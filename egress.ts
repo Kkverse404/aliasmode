@@ -3,18 +3,22 @@
 import { canonicalIp } from "./ip.ts";
 
 export const DEFAULT_EGRESS_ENDPOINTS = [
-  // High-limit plain IP endpoints first (shared airport exit IPs frequently hit ipinfo.io HTTP 429).
-  "https://api64.ipify.org?format=json",
+  // Fast global Anycast trace endpoints first (return IP + ISO country without 429 rate limits).
+  "https://1.1.1.1/cdn-cgi/trace",
+  "https://www.cloudflare.com/cdn-cgi/trace",
+  // High-limit plain IP fallbacks when Cloudflare trace is blocked by an exit ISP.
   "https://api.ipify.org?format=json",
   "https://icanhazip.com",
   "https://api.ip.sb/ip",
-  // Geo fallback last (country/city/ISP/risk are normally enriched by ip-risk.ts).
+  // Geo fallback last (shared airport exit IPs frequently hit ipinfo.io HTTP 429).
   "https://ipinfo.io/json",
 ] as const;
 
 export const DEFAULT_LATENCY_ENDPOINTS = [
-  "http://www.gstatic.com/generate_204",
-  "http://cp.cloudflare.com/generate_204",
+  // HTTPS ensures HTTP CONNECT keep-alive tunnel reuse so the 2nd probe measures
+  // true 1-RTT Unified Delay rather than re-dialing VLESS/Reality per HTTP request.
+  "https://www.gstatic.com/generate_204",
+  "https://cp.cloudflare.com/generate_204",
 ] as const;
 
 export interface EgressInfo {
@@ -76,7 +80,27 @@ export function parseEgressResponse(body: string): EgressInfo | null {
     // Plain-text endpoint response.
   }
   const ip = canonicalIp(raw);
-  return ip ? { ip } : null;
+  if (ip) return { ip };
+  // Parse Cloudflare `/cdn-cgi/trace` key=value lines (`ip=...` and `loc=HK`).
+  if (raw.includes("ip=")) {
+    let traceIp: string | null = null;
+    let traceCountry: string | undefined;
+    for (const line of raw.split(/\r?\n/)) {
+      const eq = line.indexOf("=");
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      const val = line.slice(eq + 1).trim();
+      if (key === "ip") {
+        traceIp = canonicalIp(val);
+      } else if (key === "loc" && /^[A-Z]{2}$/i.test(val) && val.toUpperCase() !== "XX" && val.toUpperCase() !== "T1") {
+        traceCountry = val.toUpperCase();
+      }
+    }
+    if (traceIp) {
+      return traceCountry ? { ip: traceIp, country: traceCountry } : { ip: traceIp };
+    }
+  }
+  return null;
 }
 
 export type EgressLookupFailure =
@@ -154,18 +178,21 @@ export async function measureHttp204Latency(
   opts: LatencyProbeOptions = {},
 ): Promise<LatencyProbeResult> {
   const endpoints = opts.endpoints?.length ? [...opts.endpoints] : [...DEFAULT_LATENCY_ENDPOINTS];
-  const primaryTimeoutMs = Math.min(opts.timeoutMs ?? 4_000, 4_000);
+  // Allow enough budget on the cold warmup request for proxy server DoH + Reality/TLS handshake,
+  // while keeping the warm 2nd request on the established CONNECT tunnel tight.
+  const warmupTimeoutMs = Math.min(opts.timeoutMs ?? 6_500, 6_500);
+  const warmRttTimeoutMs = Math.min(warmupTimeoutMs, 4_000);
   const warmup = opts.warmup !== false;
 
   for (let i = 0; i < endpoints.length; i++) {
     const endpoint = endpoints[i]!;
-    const timeoutMs = i === 0 ? primaryTimeoutMs : Math.min(primaryTimeoutMs, 3_000);
+    const firstTimeoutMs = i === 0 ? warmupTimeoutMs : Math.min(warmupTimeoutMs, 4_000);
     const firstStart = Date.now();
     try {
       const first = await fetchFn(endpoint, {
         method: "GET",
         redirect: "manual",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(firstTimeoutMs),
       });
       if (first.status === 407) {
         await first.body?.cancel().catch(() => {});
@@ -184,7 +211,7 @@ export async function measureHttp204Latency(
         const second = await fetchFn(endpoint, {
           method: "GET",
           redirect: "manual",
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(warmRttTimeoutMs),
         });
         await second.body?.cancel().catch(() => {});
         if (second.status === 204 || second.status === 200) {

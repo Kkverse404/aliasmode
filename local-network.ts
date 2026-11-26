@@ -240,11 +240,15 @@ export function buildClashTunRuleList(
   options: ClashTunRulesOptions = {},
 ): string[] {
   const platform = options.platform ?? process.platform;
-  const browserRoot = options.browserRoot ?? defaultSingBoxRuntimeRoot();
-  const runtimesRoot = options.runtimesRoot
-    ?? (platform === "win32" && process.platform !== "win32"
-      ? `${stateRoot.replace(/[\\/]+$/, "")}\\runtimes`
-      : join(resolve(stateRoot), "runtimes"));
+  const joinTargetPath = (root: string, leaf: string): string =>
+    platform === "win32" && process.platform !== "win32"
+      ? `${root.replace(/[\\/]+$/, "")}\\${leaf}`
+      : join(resolve(root), leaf);
+  const browserRoot = options.browserRoot
+    ?? (configuredStateRoot && resolve(stateRoot) === configuredStateRoot
+      ? defaultSingBoxRuntimeRoot()
+      : joinTargetPath(stateRoot, "browser"));
+  const runtimesRoot = options.runtimesRoot ?? joinTargetPath(stateRoot, "runtimes");
   if (platform === "win32") {
     const singBoxRegex = `^${escapeWindowsRegexPath(browserRoot)}\\\\.*\\\\sing-box\\.exe$`;
     const chromeRegex = `^${escapeWindowsRegexPath(runtimesRoot)}\\\\.*\\\\chrome\\.exe$`;

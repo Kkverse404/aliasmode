@@ -77,14 +77,16 @@ export interface ProxyCheckOptions extends EgressLookupOptions {
   includeRisk?: boolean;
   /** Bulk runs share the direct-IP lookup, including a failed lookup (null). */
   direct?: EgressInfo | null;
+  /** True when direct-IP comparison was intentionally skipped (e.g. sing-box or chained pool nodes) rather than offline. */
+  skipDirect?: boolean;
 }
 
 function safeFailureReason(logs: readonly string[]): ProxyConnectionFailureReason {
   const text = logs.join("\n");
   if (/\b407\b|auth(?:entication)?|credential/i.test(text)) return "authentication_failed";
-  if (/timed?\s*out|timeout/i.test(text)) return "timeout";
-  if (/ENOTFOUND|EAI_AGAIN|name.+resolv/i.test(text)) return "dns_failed";
-  if (/ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|refused/i.test(text)) return "unreachable";
+  if (/ENOTFOUND|EAI_AGAIN|no such host|name.+resolv/i.test(text)) return "dns_failed";
+  if (/timed?\s*out|timeout|deadline exceeded/i.test(text)) return "timeout";
+  if (/ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|refused|network is unreachable/i.test(text)) return "unreachable";
   return "connection_failed";
 }
 
@@ -108,6 +110,7 @@ function preferredFailureReason(attempts: readonly ProxyCheckAttempt[]): ProxyCo
 export function classifyProxyAttempts(
   attempts: readonly ProxyCheckAttempt[],
   direct: EgressInfo | null,
+  options?: { directSkipped?: boolean },
 ): ProxyCheckResult {
   const successful = attempts.flatMap((attempt) => attempt.info ? [attempt.info] : []);
   const latencies = attempts
@@ -150,7 +153,7 @@ export function classifyProxyAttempts(
   if (failed.some((attempt) => attempt.reason === "check_unavailable")) {
     return { ...base, status: "unavailable", reason: "check_unavailable" };
   }
-  if (direct) {
+  if (direct || options?.directSkipped) {
     return { ...base, status: "failed", reason: preferredFailureReason(attempts) };
   }
   return { ...base, status: "unavailable", reason: "check_unavailable" };
@@ -178,15 +181,25 @@ function makeProxiedFetch(fetchFn: typeof fetch, port: number): typeof fetch {
     fetchFn(input, { ...init, proxy: proxyUrl })) as typeof fetch;
 }
 
+function hasRelayOutboundError(logs: readonly string[]): boolean {
+  if (!logs.length) return false;
+  const text = logs.join("\n");
+  return /\bFATAL\b|\bERROR\b|upstream|refused|timed?\s*out|timeout|EOF|ENOTFOUND|EAI_AGAIN|no such host|ECONN|EHOST|ENET|\b407\b|auth/i.test(text);
+}
+
 async function runEgressAttempt(
   proxiedFetch: typeof fetch,
   lookupOptions: EgressLookupOptions,
   logs: readonly string[],
+  fastFailEndpoints = false,
 ): Promise<ProxyCheckAttempt> {
   let serviceFailed = false;
   let authenticationFailed = false;
+  const effectiveEndpoints = fastFailEndpoints && !lookupOptions.endpoints
+    ? ["https://1.1.1.1/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"]
+    : lookupOptions.endpoints;
   const { info, latencyMs } = await fetchDirectEgressTimed({
-    endpoints: lookupOptions.endpoints,
+    endpoints: effectiveEndpoints,
     timeoutMs: lookupOptions.timeoutMs,
   }, proxiedFetch, (failure) => {
     if (failure === "service_failed") serviceFailed = true;
@@ -198,13 +211,20 @@ async function runEgressAttempt(
         info: null,
         reason: authenticationFailed
           ? "authentication_failed"
-          : serviceFailed ? "check_unavailable" : safeFailureReason(logs),
+          : (serviceFailed && !hasRelayOutboundError(logs))
+            ? "check_unavailable"
+            : safeFailureReason(logs),
       };
 }
 
 function hasFatalRelayLog(logs: readonly string[]): boolean {
+  if (!logs.length) return false;
+  if (/\bFATAL\b/i.test(logs.join("\n"))) return true;
   const reason = safeFailureReason(logs);
-  return reason === "authentication_failed" || reason === "dns_failed" || reason === "unreachable";
+  return reason === "authentication_failed"
+    || reason === "dns_failed"
+    || reason === "unreachable"
+    || reason === "timeout";
 }
 
 async function proxyAttempt(
@@ -233,7 +253,8 @@ async function proxyAttempt(
         return { attempt: { info: null, reason: safeFailureReason(logs) }, latency204Ms: null };
       }
     }
-    const attempt = await runEgressAttempt(proxiedFetch, options, logs);
+    const fastFail = options.measure204 === true && latency204Ms === null && hasRelayOutboundError(logs);
+    const attempt = await runEgressAttempt(proxiedFetch, options, logs, fastFail);
     return { attempt, latency204Ms };
   } catch {
     return { attempt: { info: null, reason: safeFailureReason(logs) }, latency204Ms: null };
@@ -276,8 +297,9 @@ async function runAttemptsOnSharedRelay(
         };
       }
     }
+    const fastFail = options.measure204 && latency204Ms === null && hasRelayOutboundError(logs);
     const attempts = await Promise.all(
-      Array.from({ length: attemptCount }, () => runEgressAttempt(proxiedFetch, options, logs)),
+      Array.from({ length: attemptCount }, () => runEgressAttempt(proxiedFetch, options, logs, fastFail)),
     );
     return { attempts, latency204Ms };
   } catch {
@@ -311,7 +333,12 @@ export async function checkProxy(
   const reuseRelay = options.reuseRelay ?? (useSpecRelay || attemptCount === 1 || proxy.mode === "local-clash");
   const measure204 = options.measureLatency ?? (options.endpoints === undefined || options.latencyEndpoints !== undefined);
   const lookupOptions = { endpoints: options.endpoints, timeoutMs: options.timeoutMs };
-  const skipDirectCompare = proxy.mode === "local-clash" || normalized.mode === "local-clash";
+  const skipDirectCompare = Boolean(
+    options.skipDirect
+    || proxy.mode === "local-clash"
+    || normalized.mode === "local-clash"
+    || (options.direct === null && (isSingBoxProxy(proxy) || !!proxy.preProxy)),
+  );
 
   const [direct, probeRun] = await Promise.all([
     skipDirectCompare
@@ -343,7 +370,7 @@ export async function checkProxy(
           latency204Ms: runs.find((r) => r.latency204Ms !== null)?.latency204Ms ?? null,
         })),
   ]);
-  const classified = classifyProxyAttempts(probeRun.attempts, direct);
+  const classified = classifyProxyAttempts(probeRun.attempts, direct, { directSkipped: skipDirectCompare });
   const result: ProxyCheckResult = (classified.status === "working" || classified.status === "unstable")
     && probeRun.latency204Ms !== null
     ? { ...classified, latencyMs: probeRun.latency204Ms }

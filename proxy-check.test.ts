@@ -285,7 +285,7 @@ test("measureHttp204Latency falls back cleanly without accumulating failed endpo
       return new Response(null, { status: 204 });
     }) as unknown as typeof fetch,
   );
-  expect(probe.endpoint).toBe("http://cp.cloudflare.com/generate_204");
+  expect(probe.endpoint).toBe("https://cp.cloudflare.com/generate_204");
   expect(cfHits).toBe(2); // 1 warmup + 1 timed probe
   expect(probe.latencyMs).not.toBeNull();
   expect(probe.latencyMs!).toBeLessThan(80);
@@ -394,4 +394,44 @@ test("single-attempt pool mode reuses 1 relay for 204 probe + 1 egress lookup on
     country: "JP",
   });
   expect(result.latencyMs).toBeGreaterThanOrEqual(1);
+});
+
+test("dead sing-box pool node with skipped direct compare fails fast as timeout/connection_failed instead of unavailable", async () => {
+  let egressCalls = 0;
+  let probe204Calls = 0;
+
+  const timedOut = await checkProxy(
+    { uri: "vless://11111111-1111-1111-1111-111111111111@43.206.234.181:25331?security=tls#JP-Dead" },
+    {
+      attempts: 1,
+      reuseRelay: true,
+      measureLatency: true,
+      direct: null,
+      skipDirect: true,
+      specRelayFactory: async (_proxy, opts) => {
+        opts?.log?.("sing-box: ERROR connection: open connection using outbound/vless[proxy]: dial tcp 43.206.234.181:25331: i/o timeout");
+        return { port: 46200, close() {} };
+      },
+      fetchFn: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("generate_204")) {
+          probe204Calls++;
+          return new Response("Bad Gateway", { status: 502 });
+        }
+        egressCalls++;
+        return new Response("Bad Gateway", { status: 502 });
+      }) as unknown as typeof fetch,
+    },
+  );
+
+  // Must bail out right after the 204 probes without retrying all egress endpoints,
+  // and must classify as `failed` (`timeout`) rather than `unavailable` (`check_unavailable`).
+  expect(probe204Calls).toBe(2);
+  expect(egressCalls).toBe(0);
+  expect(timedOut).toEqual({
+    status: "failed",
+    attempts: 1,
+    successes: 0,
+    reason: "timeout",
+  });
 });

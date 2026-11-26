@@ -942,11 +942,12 @@ export async function handleUiRequest(
   // Local 3-mode network routing settings (Local Clash proxy URL + TUN rules helper).
   if (pathname === "/ui/api/network" && req.method === "GET") {
     const root = options.paths?.root ?? APPLICATION_ROOT;
+    const ruleOpts = options.paths?.browser ? { browserRoot: options.paths.browser } : {};
     return noStoreJson({
       ok: true,
       settings: readLocalNetworkSettings(),
-      clashTunRules: buildClashTunRules(root),
-      clashVergeScript: buildClashVergeScript(root),
+      clashTunRules: buildClashTunRules(root, ruleOpts),
+      clashVergeScript: buildClashVergeScript(root, ruleOpts),
     });
   }
 
@@ -960,11 +961,12 @@ export async function handleUiRequest(
         ...(typeof body.routeNodesViaSingBox === "boolean" ? { routeNodesViaSingBox: body.routeNodesViaSingBox } : {}),
       });
       const root = options.paths?.root ?? APPLICATION_ROOT;
+      const ruleOpts = options.paths?.browser ? { browserRoot: options.paths.browser } : {};
       return noStoreJson({
         ok: true,
         settings,
-        clashTunRules: buildClashTunRules(root),
-        clashVergeScript: buildClashVergeScript(root),
+        clashTunRules: buildClashTunRules(root, ruleOpts),
+        clashVergeScript: buildClashVergeScript(root, ruleOpts),
       });
     } catch (error) {
       return noStoreJson({ ok: false, error: msg(error) }, 400);

@@ -107,6 +107,13 @@ describe("3-mode local network & Local Clash routing", () => {
       const rules = buildClashTunRules(root);
       expect(rules).toContain("AND,((IN-TYPE,TUN),(PROCESS-PATH-REGEX,");
       expect(rules).toContain(")),DIRECT");
+
+      // Explicit stateRoot without browserRoot must derive `<stateRoot>\browser`, never process CWD
+      const appDataRules = buildClashTunRuleList("C:\\Users\\Demo\\AppData\\Roaming\\com.aliasmode.desktop", {
+        platform: "win32",
+      });
+      const singBoxInner = appDataRules[0]!.slice("AND,((IN-TYPE,TUN),(PROCESS-PATH-REGEX,".length, -")),DIRECT".length);
+      expect(new RegExp(singBoxInner).test("C:\\Users\\Demo\\AppData\\Roaming\\com.aliasmode.desktop\\browser\\sing-box-1.14.4\\sing-box.exe")).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

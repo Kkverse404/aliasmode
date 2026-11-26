@@ -1,10 +1,16 @@
 import { expect, test } from "bun:test";
-import { fetchDirectEgress, parseEgressResponse, resolveEgressEndpoints } from "./egress.ts";
+import { DEFAULT_LATENCY_ENDPOINTS, fetchDirectEgress, parseEgressResponse, resolveEgressEndpoints } from "./egress.ts";
 
-test("parseEgressResponse accepts JSON and plain IPv4/IPv6 responses", () => {
+test("parseEgressResponse accepts JSON, Cloudflare cdn-cgi/trace, and plain IPv4/IPv6 responses", () => {
   expect(parseEgressResponse('{"ip":"203.0.113.4","country":"US"}')).toEqual({ ip: "203.0.113.4", country: "US" });
   expect(parseEgressResponse('{"query":"2001:db8::1"}')).toEqual({ ip: "2001:db8::1" });
   expect(parseEgressResponse("198.51.100.9\n")).toEqual({ ip: "198.51.100.9" });
+  expect(parseEgressResponse("fl=975f65\nh=1.1.1.1\nip=45.207.156.192\nts=1795683258.000\nloc=HK\n")).toEqual({
+    ip: "45.207.156.192",
+    country: "HK",
+  });
+  expect(parseEgressResponse("ip=203.0.113.55\nloc=XX\n")).toEqual({ ip: "203.0.113.55" });
+  expect(DEFAULT_LATENCY_ENDPOINTS.every((u) => u.startsWith("https://"))).toBe(true);
 });
 
 test("parseEgressResponse rejects malformed responses", () => {

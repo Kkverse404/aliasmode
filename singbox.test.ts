@@ -250,10 +250,44 @@ describe("sing-box binary validation & real sidecar relay", () => {
       server_port: 443,
       path: "/dns-query",
     });
-    expect(cfg.route.default_domain_resolver).toEqual({
-      server: "doh-ali",
-      strategy: "prefer_ipv4",
+    expect(cfg.route).toEqual({
+      final: "proxy",
+      auto_detect_interface: true,
+      default_domain_resolver: {
+        server: "doh-ali",
+        strategy: "prefer_ipv4",
+      },
     });
+
+    // Loopback outermost hop (e.g. Local Clash preProxy) must NOT set auto_detect_interface
+    const loopbackChain = normalizeProxySpec({
+      type: "socks5",
+      host: "203.0.113.10",
+      port: "1080",
+      user: "",
+      pass: "",
+      preProxy: { type: "http", host: "127.0.0.1", port: "7897", user: "", pass: "" },
+    })!;
+    expect(buildSingBoxConfig(loopbackChain, 23458).route.auto_detect_interface).toBeUndefined();
+
+    // Pre-resolved hosts inject `hosts-pre` DNS server and pass `sing-box check`
+    const preCfg = buildSingBoxConfig(parseProxySpec("vless", SAMPLES.vlessReality)!, 23459, {
+      predefinedHosts: { "node.example.com": ["198.51.100.25"] },
+    });
+    expect(preCfg.dns.servers[0]).toEqual({
+      type: "hosts",
+      tag: "hosts-pre",
+      predefined: { "node.example.com": ["198.51.100.25"] },
+    });
+    expect(preCfg.outbounds[0]?.domain_resolver).toBe("hosts-pre");
+    const preFile = join(tmpdir(), `aliasmode-sb-check-pre-${Date.now()}.json`);
+    writeFileSync(preFile, JSON.stringify(preCfg, null, 2));
+    try {
+      const res = Bun.spawnSync([singboxPath, "check", "-c", preFile]);
+      expect(res.exitCode, res.stderr.toString()).toBe(0);
+    } finally {
+      rmSync(preFile, { force: true });
+    }
 
     // Chain proxy: VLESS Reality transit -> Residential SOCKS5 landing
     const chain = normalizeProxySpec({

@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { renameWhenUnlocked, sha256File, windowsSystemTool } from "./browser-install.ts";
-import { buildSingBoxConfig } from "./singbox-config.ts";
+import { buildSingBoxConfig, flattenProxyChain } from "./singbox-config.ts";
 import type { ProxyRelay, RelayOptions } from "./proxy-relay.ts";
 import type { ProxySpec } from "./types.ts";
 
@@ -252,17 +252,42 @@ export async function ensureSingBoxBinary(
   return promise;
 }
 
-function allocateLoopbackPort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
+// Allocate loopback ports strictly below the OS ephemeral client port range
+// (Linux 32768-60999, Windows/macOS 49152-65535). Using `listen(0)` hands out
+// sequential ephemeral ports that sibling outbound `fetch`/`net.connect` calls
+// immediately steal before `sing-box` binds, causing EADDRINUSE or TCP self-connect.
+const LOOPBACK_PORT_MIN = 20_000;
+const LOOPBACK_PORT_MAX = 32_000;
+const reservedLoopbackPorts = new Set<number>();
+let loopbackPortCursor = LOOPBACK_PORT_MIN + (process.pid % 4_000);
+
+function tryBindLoopbackPort(port: number): Promise<number | null> {
+  return new Promise((resolvePort) => {
     const server = net.createServer();
     server.unref();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.once("error", () => resolvePort(null));
+    server.listen(port, "127.0.0.1", () => {
       const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      server.close((err) => (err ? reject(err) : resolvePort(port)));
+      const bound = typeof addr === "object" && addr ? addr.port : 0;
+      server.close((err) => resolvePort(err || !bound ? null : bound));
     });
   });
+}
+
+async function allocateLoopbackPort(): Promise<number> {
+  const span = LOOPBACK_PORT_MAX - LOOPBACK_PORT_MIN;
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const candidate = LOOPBACK_PORT_MIN + ((loopbackPortCursor++ - LOOPBACK_PORT_MIN) % span);
+    if (reservedLoopbackPorts.has(candidate)) continue;
+    reservedLoopbackPorts.add(candidate);
+    const bound = await tryBindLoopbackPort(candidate);
+    if (bound !== null) return bound;
+    reservedLoopbackPorts.delete(candidate);
+  }
+  const fallback = await tryBindLoopbackPort(0);
+  if (fallback === null) throw new Error("failed to allocate loopback port for sing-box");
+  reservedLoopbackPorts.add(fallback);
+  return fallback;
 }
 
 function probeLoopbackPort(port: number, timeoutMs = 200): Promise<boolean> {
@@ -276,9 +301,93 @@ function probeLoopbackPort(port: number, timeoutMs = 200): Promise<boolean> {
       resolveReady(ok);
     };
     const timer = setTimeout(() => finish(false), timeoutMs);
-    socket.once("connect", () => { clearTimeout(timer); finish(true); });
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      // Guard against TCP simultaneous-open self-connection (`127.0.0.1:P -> 127.0.0.1:P`).
+      if (socket.localPort === port) {
+        finish(false);
+        return;
+      }
+      finish(true);
+    });
     socket.once("error", () => { clearTimeout(timer); finish(false); });
   });
+}
+
+const DOH_JSON_RESOLVERS = [
+  "https://223.5.5.5/resolve",
+  "https://223.6.6.6/resolve",
+] as const;
+
+const DOH_CACHE_TTL_MS = 10 * 60_000;
+const dohHostCache = new Map<string, { ips: string[]; expiresAt: number }>();
+const dohInFlight = new Map<string, Promise<string[]>>();
+
+function isUsableResolvedIpv4(ip: string): boolean {
+  if (net.isIP(ip) !== 4) return false;
+  // Reject loopback, unspecified, link-local, and Clash/Mihomo Fake-IP (`198.18.0.0/15`).
+  if (ip.startsWith("127.") || ip.startsWith("0.") || ip.startsWith("169.254.")) return false;
+  if (ip.startsWith("198.18.") || ip.startsWith("198.19.")) return false;
+  return true;
+}
+
+async function resolveProxyHostIps(host: string): Promise<string[]> {
+  const clean = host.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if (!clean || clean === "localhost" || clean.endsWith(".test") || clean.endsWith(".example") || clean.endsWith(".example.com") || clean.endsWith(".invalid") || net.isIP(clean) !== 0) {
+    return [];
+  }
+  const now = Date.now();
+  const cached = dohHostCache.get(clean);
+  if (cached && cached.expiresAt > now) return cached.ips;
+
+  const existing = dohInFlight.get(clean);
+  if (existing) return existing;
+
+  const lookup = (async (): Promise<string[]> => {
+    try {
+      const ips = await Promise.any(
+        DOH_JSON_RESOLVERS.map(async (endpoint) => {
+          const url = `${endpoint}?name=${encodeURIComponent(clean)}&type=A`;
+          const res = await fetch(url, {
+            headers: { Accept: "application/dns-json" },
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (!res.ok) throw new Error(`DoH ${res.status}`);
+          const data = (await res.json()) as { Answer?: Array<{ type?: number; data?: string }> };
+          const found = (data.Answer ?? [])
+            .filter((ans) => ans.type === 1 && typeof ans.data === "string" && isUsableResolvedIpv4(ans.data.trim()))
+            .map((ans) => ans.data!.trim());
+          if (!found.length) throw new Error("no A record");
+          return [...new Set(found)];
+        }),
+      );
+      dohHostCache.set(clean, { ips, expiresAt: Date.now() + DOH_CACHE_TTL_MS });
+      return ips;
+    } catch {
+      return [];
+    } finally {
+      dohInFlight.delete(clean);
+    }
+  })();
+
+  dohInFlight.set(clean, lookup);
+  return lookup;
+}
+
+async function preResolveChainHosts(proxy: ProxySpec): Promise<Record<string, string[]>> {
+  if (process.env.ALIASMODE_SINGBOX_PRERESOLVE === "0") return {};
+  const hosts = [...new Set(
+    flattenProxyChain(proxy)
+      .map((hop) => hop.host.trim().replace(/^\[|\]$/g, "").toLowerCase())
+      .filter((h) => h && h !== "localhost" && net.isIP(h) === 0),
+  )];
+  if (!hosts.length) return {};
+  const entries = await Promise.all(hosts.map(async (h) => [h, await resolveProxyHostIps(h)] as const));
+  const map: Record<string, string[]> = {};
+  for (const [h, ips] of entries) {
+    if (ips.length) map[h] = ips;
+  }
+  return map;
 }
 
 interface ActiveRelayHandle {
@@ -356,8 +465,10 @@ export async function startSingBoxRelay(
 ): Promise<ProxyRelay> {
   const log = opts.log ?? (() => {});
   const binaryPath = opts.binaryPath ?? await ensureSingBoxBinary(opts.runtimeRoot ?? defaultSingBoxRuntimeRoot());
+  const predefinedHosts = await preResolveChainHosts(proxy);
+  const ownedPort = !(opts.port && opts.port > 0);
   const port = opts.port && opts.port > 0 ? opts.port : await allocateLoopbackPort();
-  const config = buildSingBoxConfig(proxy, port);
+  const config = buildSingBoxConfig(proxy, port, { predefinedHosts });
 
   const tempDir = mkdtempSync(join(tmpdir(), "aliasmode-sb-"));
   const configPath = join(tempDir, "config.json");
@@ -405,6 +516,7 @@ export async function startSingBoxRelay(
     if (closed) return;
     closed = true;
     activeRelays.delete(handle);
+    if (ownedPort) reservedLoopbackPorts.delete(port);
     try { child.kill(); } catch {}
     if (syncExit) {
       try { rmSync(tempDir, { recursive: true, force: true }); } catch {}
@@ -418,6 +530,8 @@ export async function startSingBoxRelay(
 
   const deadline = Date.now() + (opts.startupTimeoutMs ?? 8_000);
   try {
+    // Allow sing-box ~40ms to initialize before the first TCP probe.
+    await Promise.race([Bun.sleep(40), exitPromise]);
     while (Date.now() < deadline) {
       if (exited) {
         const detail = stderrChunks.join("").trim().slice(0, 400);
