@@ -50,6 +50,16 @@
 | **macOS Intel (x64)** | `AliasMode_<ver>_x64.dmg` / `.app.tar.gz` | 适用于 Intel 芯片 Mac |
 | **Linux x86_64** | `AliasMode_<ver>_amd64.deb` / `_x86_64-linux.tar.gz` | Debian / Ubuntu 推荐 `.deb`，其他发行版可用 `.tar.gz` |
 
+macOS / Linux 也支持终端一键安装（自动校验 SHA-256 并拉取本仓库最新版）：
+
+```sh
+# macOS (Apple Silicon / Intel)
+curl -fsSL https://raw.githubusercontent.com/Kkverse404/aliasmode/main/scripts/install-macos.sh | bash
+
+# Linux x86_64
+curl -fsSL https://raw.githubusercontent.com/Kkverse404/aliasmode/main/scripts/install-linux.sh | bash
+```
+
 > **使用提示**
 > - **macOS 首次打开**：由于未经过 Apple 商业公证，如系统提示「已损坏」或无法验证开发者，请在终端执行 `xattr -dr com.apple.quarantine /Applications/AliasMode.app`，或在 **系统设置 → 隐私与安全性** 中点击「仍要打开」。
 > - **Clash TUN 模式**：若同时开启 Clash Verge / Mihomo TUN，建议在应用内 **「设置 → WebDAV 同步与网络」** 复制生成的 TUN 放行规则并应用，确保「本地直连」「代理节点」与「本地 Clash」三种模式均可正常工作。

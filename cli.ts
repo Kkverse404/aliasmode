@@ -156,6 +156,22 @@ export function desktopFirstRunMode(
   return "local";
 }
 
+/**
+ * In this WebDAV-first fork, desktop builds always open in Local mode — including
+ * when upgrading over an existing upstream installation that previously wrote
+ * `mode: "cloud"` to `config.json`. Set `ALIASMODE_ALLOW_OFFICIAL_CLOUD=1` to opt out.
+ */
+export function resolveDesktopStartupMode(
+  savedMode: AppConfig,
+  desktop: boolean,
+  env: Record<string, string | undefined> = process.env,
+): "local" | "cloud" | null {
+  if (!desktop) return null;
+  if (savedMode.mode === "unconfigured") return desktopFirstRunMode(desktop, env);
+  if (savedMode.mode === "cloud" && env.ALIASMODE_ALLOW_OFFICIAL_CLOUD !== "1") return "local";
+  return null;
+}
+
 export function cloudRuntimeConfiguration(
   config: AppConfig,
   env: Record<string, string | undefined> = process.env,
@@ -2673,9 +2689,9 @@ async function main() {
   }
   const appConfig = new AppConfigStore(paths.config);
   let savedMode = appConfig.read();
-  const firstRunMode = savedMode.mode === "unconfigured" ? desktopFirstRunMode(desktop) : null;
-  if (firstRunMode) {
-    savedMode = appConfig.setMode(firstRunMode, firstRunMode === "cloud" ? selectedCloudUrl(savedMode) : undefined);
+  const startupMode = resolveDesktopStartupMode(savedMode, desktop);
+  if (startupMode) {
+    savedMode = appConfig.setMode(startupMode, startupMode === "cloud" ? selectedCloudUrl(savedMode) : undefined);
   }
   const defaultCloudUrl = selectedCloudUrl(savedMode);
   const cloudConfig = cloudRuntimeConfiguration(savedMode);

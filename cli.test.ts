@@ -3,6 +3,7 @@ import {
   cloudLauncherSmokeEngine,
   cloudRuntimeConfiguration,
   desktopFirstRunMode,
+  resolveDesktopStartupMode,
   createCloudCrossDeviceFixtureHandler,
   createCloudRestoreFixtureHandler,
   dispatchReadSessionWorker,
@@ -959,6 +960,22 @@ test("desktop first run starts in Local mode (WebDAV sync); CLI runs stay unconf
   expect(desktopFirstRunMode(true, {})).toBe("local");
   expect(desktopFirstRunMode(true, { ALIASMODE_BACKGROUND: "1" })).toBe("local");
   expect(desktopFirstRunMode(false, {})).toBeNull();
+  expect(
+    resolveDesktopStartupMode({ version: 1, mode: "cloud", cloudUrl: "https://api.aliasmode.com", localAnalytics: false }, true, {}),
+  ).toBe("local");
+  expect(
+    resolveDesktopStartupMode(
+      { version: 1, mode: "cloud", cloudUrl: "https://api.aliasmode.com", localAnalytics: false },
+      true,
+      { ALIASMODE_ALLOW_OFFICIAL_CLOUD: "1" },
+    ),
+  ).toBeNull();
+  expect(
+    resolveDesktopStartupMode({ version: 1, mode: "local", localAnalytics: false }, true, {}),
+  ).toBeNull();
+  expect(
+    resolveDesktopStartupMode({ version: 1, mode: "cloud", cloudUrl: "https://api.aliasmode.com", localAnalytics: false }, false, {}),
+  ).toBeNull();
 });
 
 test("official Cloud configuration works without environment variables", () => {
