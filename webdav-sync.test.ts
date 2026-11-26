@@ -115,6 +115,7 @@ describe("3-mode local network & Local Clash routing", () => {
       const singBoxInner = appDataRules[0]!.slice("AND,((IN-TYPE,TUN),(PROCESS-PATH-REGEX,".length, -")),DIRECT".length);
       expect(new RegExp(singBoxInner).test("C:\\Users\\Demo\\AppData\\Roaming\\com.aliasmode.desktop\\browser\\sing-box-1.14.4\\sing-box.exe")).toBe(true);
     } finally {
+      setLocalNetworkStateRoot(null);
       rmSync(root, { recursive: true, force: true });
     }
   });

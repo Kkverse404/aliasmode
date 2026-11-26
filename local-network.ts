@@ -33,8 +33,13 @@ export const DEFAULT_LOCAL_NETWORK_SETTINGS: LocalNetworkSettings = {
 let configuredSettingsPath: string | null = null;
 let configuredStateRoot: string | null = null;
 
-/** Initialize persisted local network settings under `<stateRoot>/network-settings.json`. */
-export function setLocalNetworkStateRoot(stateRoot: string): void {
+/** Initialize persisted local network settings under `<stateRoot>/network-settings.json` (pass null to reset in tests). */
+export function setLocalNetworkStateRoot(stateRoot: string | null): void {
+  if (!stateRoot) {
+    configuredStateRoot = null;
+    configuredSettingsPath = null;
+    return;
+  }
   configuredStateRoot = resolve(stateRoot);
   configuredSettingsPath = join(configuredStateRoot, "network-settings.json");
 }
@@ -135,7 +140,8 @@ export function resolveRuntimeProxy(
  * whenever `sing-box` is installed).
  */
 export function shouldRouteNodesViaSingBox(proxy?: ProxySpec | null): boolean {
-  if (!configuredSettingsPath) return false;
+  if (process.env.NODE_ENV === "test" && process.env.ALIASMODE_ENABLE_SINGBOX_IN_TESTS !== "1") return false;
+  if (!configuredSettingsPath || !configuredStateRoot || !existsSync(configuredStateRoot)) return false;
   if (proxy?.mode === "local-clash") return false;
   const settings = readLocalNetworkSettings();
   if (!settings.routeNodesViaSingBox) return false;
